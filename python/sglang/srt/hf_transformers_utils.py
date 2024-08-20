@@ -33,10 +33,12 @@ from transformers import (
 
 try:
     from vllm.transformers_utils.configs import ChatGLMConfig, DbrxConfig
+    from sglang.srt.configs.glm import GLMConfig
 
     _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         ChatGLMConfig.model_type: ChatGLMConfig,
         DbrxConfig.model_type: DbrxConfig,
+        GLMConfig.model_type: GLMConfig,
     }
 except ImportError:
     # We want this file to run without vllm dependency
