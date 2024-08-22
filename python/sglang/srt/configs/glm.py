@@ -49,6 +49,7 @@ class GLMConfig(PretrainedConfig):
             no_repeat_ngram_size=0,
             tie_word_embeddings=True,
             use_bias=True,
+            use_qkv_bias=False,
             focused_attention=False,
             unidirectional=False,
             unidirectional_attention=False,
@@ -120,6 +121,7 @@ class GLMConfig(PretrainedConfig):
         self.no_repeat_ngram_size = no_repeat_ngram_size
         self.tie_word_embeddings = tie_word_embeddings
         self.use_bias = use_bias
+        self.use_qkv_bias = use_qkv_bias
         self.focused_attention = focused_attention
         self.causal_lm = unidirectional_attention or unidirectional
         self.gate_up = gate_up

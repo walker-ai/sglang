@@ -125,7 +125,7 @@ class GLMAttention(nn.Module):
             self.head_dim,
             self.total_num_heads,
             self.total_kv_heads,
-            bias=config.use_bias,
+            bias=(config.use_bias or config.use_qkv_bias),
             quant_config=quant_config,
         )
 
