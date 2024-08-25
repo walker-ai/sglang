@@ -28,10 +28,10 @@ from sglang.srt.server import Runtime
 DEFAULT_PROMPTS = [
     # the output of gemma-2-2b from SRT is unstable on the commented prompt
     # "The capital of France is",
+    "Apple is red. Banana is Yellow. " * 800 + "Apple is",
     "The capital of the United Kindom is",
     "Today is a sunny day and I like",
     "AI is a field of computer science focused on",
-    "Apple is red. Banana is Yellow. " * 800 + "Apple is",
 ]
 
 dirpath = os.path.dirname(__file__)
@@ -86,7 +86,6 @@ class HFRunner:
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
             torch_dtype=torch_dtype,
-            trust_remote_code=True,
         )
 
         self.is_generation_model = is_generation_model
@@ -96,7 +95,6 @@ class HFRunner:
                 model_path,
                 torch_dtype=torch_dtype,
                 low_cpu_mem_usage=True,
-                trust_remote_code=True,
             ).cuda()
         else:
             from sentence_transformers import SentenceTransformer
