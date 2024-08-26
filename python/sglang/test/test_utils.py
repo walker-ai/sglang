@@ -23,17 +23,14 @@ from sglang.utils import get_exception_traceback
 
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Meta-Llama-3.1-8B-Instruct"
 DEFAULT_MOE_MODEL_NAME_FOR_TEST = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH = 600
 
 if os.getenv("SGLANG_IS_IN_CI", "false") == "true":
-    DEFAULT_URL_FOR_MOE_TEST = "http://127.0.0.1:6157"
-    DEFAULT_URL_FOR_ACCURACY_TEST = "http://127.0.0.1:7157"
-    DEFAULT_URL_FOR_UNIT_TEST = "http://127.0.0.1:8157"
-    DEFAULT_URL_FOR_E2E_TEST = "http://127.0.0.1:9157"
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 5157
+    DEFAULT_URL_FOR_TEST = "http://127.0.0.1:6157"
 else:
-    DEFAULT_URL_FOR_MOE_TEST = "http://127.0.0.1:1157"
-    DEFAULT_URL_FOR_ACCURACY_TEST = "http://127.0.0.1:1257"
-    DEFAULT_URL_FOR_UNIT_TEST = "http://127.0.0.1:1357"
-    DEFAULT_URL_FOR_E2E_TEST = "http://127.0.0.1:1457"
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 1157
+    DEFAULT_URL_FOR_TEST = "http://127.0.0.1:2157"
 
 
 def call_generate_lightllm(prompt, temperature, max_tokens, stop=None, url=None):
@@ -460,24 +457,25 @@ def run_with_timeout(
     return ret_value[0]
 
 
+def run_one_file(filename, out_queue):
+    print(f"\n\nRun {filename}\n\n")
+    ret = unittest.main(module=None, argv=["", "-vb"] + [filename])
+
+
 def run_unittest_files(files: List[str], timeout_per_file: float):
     tic = time.time()
     success = True
 
     for filename in files:
+        out_queue = multiprocessing.Queue()
+        p = multiprocessing.Process(target=run_one_file, args=(filename, out_queue))
 
-        def func():
-            print(f"\n\nRun {filename}\n\n")
-            ret = unittest.main(module=None, argv=["", "-vb"] + [filename])
-
-        p = multiprocessing.Process(target=func)
-
-        def run_one_file():
+        def run_process():
             p.start()
             p.join()
 
         try:
-            run_with_timeout(run_one_file, timeout=timeout_per_file)
+            run_with_timeout(run_process, timeout=timeout_per_file)
             if p.exitcode != 0:
                 success = False
                 break
