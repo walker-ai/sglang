@@ -31,7 +31,7 @@ from sglang.global_config import global_config
 from sglang.srt.constrained.fsm_cache import FSMCache
 from sglang.srt.constrained.jump_forward import JumpForwardCache
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import LogitProcessorOutput
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOut,
@@ -108,7 +108,7 @@ class ModelTpServer:
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
-            if is_multimodal_model(server_args.model_path):
+            if is_multimodal_model(self.model_config.hf_config.architectures):
                 self.processor = get_processor(
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,
@@ -333,26 +333,24 @@ class ModelTpServer:
         if self.model_runner.is_generation:
             req.pixel_values = recv_req.pixel_values
             if req.pixel_values is not None:
-                image_hash = (
-                    hash(tuple(recv_req.image_hash))
-                    if isinstance(recv_req.image_hash, list)
-                    else recv_req.image_hash
-                )
+                # Use image hash as fake token_ids, which is then used
+                # for prefix matching
+                image_hash = hash(tuple(recv_req.image_hashes))
                 req.pad_value = [
                     (image_hash) % self.model_config.vocab_size,
                     (image_hash >> 16) % self.model_config.vocab_size,
                     (image_hash >> 32) % self.model_config.vocab_size,
                     (image_hash >> 64) % self.model_config.vocab_size,
                 ]
-                req.image_size = recv_req.image_size
+                req.image_sizes = recv_req.image_sizes
                 (
                     req.origin_input_ids,
-                    req.image_offset,
+                    req.image_offsets,
                 ) = self.model_runner.model.pad_input_ids(
                     req.origin_input_ids_unpadded,
                     req.pad_value,
-                    req.pixel_values.shape,
-                    req.image_size,
+                    req.pixel_values,
+                    req.image_sizes,
                 )
             req.return_logprob = recv_req.return_logprob
             req.logprob_start_len = recv_req.logprob_start_len
@@ -368,6 +366,7 @@ class ModelTpServer:
                     req.jump_forward_map = self.jump_forward_cache.query(
                         computed_regex_string
                     )
+
             # Init regex fsm
             elif req.sampling_params.regex is not None:
                 req.regex_fsm = self.regex_fsm_cache.query(req.sampling_params.regex)
@@ -505,29 +504,21 @@ class ModelTpServer:
         if self.model_runner.is_generation:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
-                sample_output, logits_output = self.model_runner.forward(
-                    batch, ForwardMode.EXTEND
-                )
-                next_token_ids = batch.check_sample_results(sample_output)
+                output = self.model_runner.forward(batch, ForwardMode.EXTEND)
+                next_token_ids = batch.sample(output.next_token_logits)
                 batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                     next_token_ids
                 )
 
                 # Move logprobs to cpu
-                if logits_output.next_token_logprobs is not None:
-                    logits_output.next_token_logprobs = (
-                        logits_output.next_token_logprobs[
-                            torch.arange(
-                                len(next_token_ids), device=next_token_ids.device
-                            ),
-                            next_token_ids,
-                        ].tolist()
-                    )
-                    logits_output.input_token_logprobs = (
-                        logits_output.input_token_logprobs.tolist()
-                    )
-                    logits_output.normalized_prompt_logprobs = (
-                        logits_output.normalized_prompt_logprobs.tolist()
+                if output.next_token_logprobs is not None:
+                    output.next_token_logprobs = output.next_token_logprobs[
+                        torch.arange(len(next_token_ids), device=next_token_ids.device),
+                        next_token_ids,
+                    ].tolist()
+                    output.input_token_logprobs = output.input_token_logprobs.tolist()
+                    output.normalized_prompt_logprobs = (
+                        output.normalized_prompt_logprobs.tolist()
                     )
 
                 next_token_ids = next_token_ids.tolist()
@@ -566,14 +557,12 @@ class ModelTpServer:
                     self.req_to_token_pool.free(req.req_pool_idx)
 
                 if req.return_logprob:
-                    self.add_logprob_return_values(
-                        i, req, pt, next_token_ids, logits_output
-                    )
+                    self.add_logprob_return_values(i, req, pt, next_token_ids, output)
                     pt += req.extend_input_len
         else:
             assert batch.extend_num_tokens != 0
-            logits_output = self.model_runner.forward(batch, ForwardMode.EXTEND)
-            embeddings = logits_output.embeddings.tolist()
+            output = self.model_runner.forward(batch, ForwardMode.EXTEND)
+            embeddings = output.embeddings.tolist()
 
             # Check finish conditions
             for i, req in enumerate(batch.reqs):
@@ -601,7 +590,7 @@ class ModelTpServer:
         req: Req,
         pt: int,
         next_token_ids: List[int],
-        output: LogitsProcessorOutput,
+        output: LogitProcessorOutput,
     ):
         if req.normalized_prompt_logprob is None:
             req.normalized_prompt_logprob = output.normalized_prompt_logprobs[i]
@@ -683,17 +672,15 @@ class ModelTpServer:
         batch.prepare_for_decode()
 
         # Forward and sample the next tokens
-        sample_output, logits_output = self.model_runner.forward(
-            batch, ForwardMode.DECODE
-        )
-        next_token_ids = batch.check_sample_results(sample_output)
+        output = self.model_runner.forward(batch, ForwardMode.DECODE)
+        next_token_ids = batch.sample(output.next_token_logits)
         batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             next_token_ids
         )
 
         # Move logprobs to cpu
-        if logits_output.next_token_logprobs is not None:
-            next_token_logprobs = logits_output.next_token_logprobs[
+        if output.next_token_logprobs is not None:
+            next_token_logprobs = output.next_token_logprobs[
                 torch.arange(len(next_token_ids), device=next_token_ids.device),
                 next_token_ids,
             ].tolist()
@@ -719,7 +706,7 @@ class ModelTpServer:
                     (next_token_logprobs[i], next_token_id)
                 )
                 if req.top_logprobs_num > 0:
-                    req.output_top_logprobs.append(logits_output.output_top_logprobs[i])
+                    req.output_top_logprobs.append(output.output_top_logprobs[i])
 
         self.handle_finished_requests(batch)
 

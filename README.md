@@ -56,7 +56,7 @@ pip install flashinfer -i https://flashinfer.ai/whl/cu121/torch2.4/
 ### Method 2: From source
 ```
 # Use the last release branch
-git clone -b v0.2.14 https://github.com/sgl-project/sglang.git
+git clone -b v0.2.14.post1 https://github.com/sgl-project/sglang.git
 cd sglang
 
 pip install --upgrade pip
@@ -240,7 +240,7 @@ python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 - Qwen / Qwen 2 / Qwen 2 MoE
 - DeepSeek / DeepSeek 2
 - [LLaVA-OneVision](https://llava-vl.github.io/blog/2024-08-05-llava-onevision/)
-  - `python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-72b-ov --port=30000 --tp-size=8 --chat-template=chatml-llava --chunked-prefill-size=16384`
+  - `python3 -m sglang.launch_server --model-path lmms-lab/llava-onevision-qwen2-72b-ov --port=30000 --tp-size=8 --chat-template=chatml-llava`
   - Query the server with the [OpenAI Vision API](https://platform.openai.com/docs/guides/vision). See examples at [test/srt/test_vision_openai_server.py](test/srt/test_vision_openai_server.py)
 - LLaVA 1.5 / 1.6 / NeXT
   - `python -m sglang.launch_server --model-path lmms-lab/llama3-llava-next-8b --port=30000 --tp-size=1 --chat-template=llava_llama_3`

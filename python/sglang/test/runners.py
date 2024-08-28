@@ -30,7 +30,7 @@ DEFAULT_PROMPTS = [
     # the output of gemma-2-2b from SRT is unstable on the commented prompt
     # "The capital of France is",
     "Apple is red. Banana is Yellow. " * 800 + "Apple is",
-    "The capital of the United Kindom is",
+    "The capital of the United Kingdom is",
     "Today is a sunny day and I like",
     "AI is a field of computer science focused on",
 ]
@@ -180,7 +180,7 @@ class SRTRunner:
             tp_size=tp_size,
             dtype=get_dtype_str(torch_dtype),
             port=port,
-            mem_fraction_static=0.69,
+            mem_fraction_static=0.7,
             trust_remote_code=False,
             is_embedding=not self.is_generation,
         )

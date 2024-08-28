@@ -21,7 +21,7 @@ import importlib.resources
 import logging
 import pkgutil
 from functools import lru_cache
-from typing import Optional, Tuple, Type
+from typing import Optional, Type
 
 import torch
 import torch.nn as nn
@@ -44,15 +44,13 @@ from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.global_config import global_config
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import SampleOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.model_config import AttentionArch
+from sglang.srt.model_config import AttentionArch, ModelConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, InputMetadata
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
@@ -71,7 +69,7 @@ logger = logging.getLogger(__name__)
 class ModelRunner:
     def __init__(
         self,
-        model_config,
+        model_config: ModelConfig,
         mem_fraction_static: float,
         gpu_id: int,
         tp_rank: int,
@@ -87,7 +85,9 @@ class ModelRunner:
         self.tp_size = tp_size
         self.nccl_port = nccl_port
         self.server_args = server_args
-        self.is_multimodal_model = is_multimodal_model(self.model_config)
+        self.is_multimodal_model = is_multimodal_model(
+            self.model_config.hf_config.architectures
+        )
         global_server_args_dict.update(
             {
                 "disable_flashinfer": server_args.disable_flashinfer,
@@ -96,6 +96,13 @@ class ModelRunner:
                 "enable_mla": server_args.enable_mla,
             }
         )
+
+        if self.is_multimodal_model:
+            logger.info(
+                "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
+            )
+            server_args.chunked_prefill_size = None
+            server_args.mem_fraction_static *= 0.95
 
         min_per_gpu_memory = self.init_torch_distributed()
         self.load_model()
@@ -509,19 +516,15 @@ class ModelRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n"
                 "Possible solutions:\n"
-                "1. disable torch compile by not using --enable-torch-compile\n"
-                "2. disable cuda graph by --disable-cuda-graph\n"
-                "3. set --mem-fraction-static to a smaller value\n"
+                "1. disable cuda graph by --disable-cuda-graph\n"
+                "2. set --mem-fraction-static to a smaller value\n"
+                "3. disable torch compile by not using --enable-torch-compile\n"
                 "Open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose \n"
             )
 
     @torch.inference_mode()
     def forward_decode(self, batch: ScheduleBatch):
-        if (
-            self.cuda_graph_runner
-            and self.cuda_graph_runner.can_run(len(batch.reqs))
-            and not batch.sampling_info.has_bias()
-        ):
+        if self.cuda_graph_runner and self.cuda_graph_runner.can_run(len(batch.reqs)):
             return self.cuda_graph_runner.replay(batch)
 
         input_metadata = InputMetadata.from_schedule_batch(
@@ -570,9 +573,7 @@ class ModelRunner:
             input_metadata.image_offsets,
         )
 
-    def forward(
-        self, batch: ScheduleBatch, forward_mode: ForwardMode
-    ) -> Tuple[SampleOutput, LogitsProcessorOutput]:
+    def forward(self, batch: ScheduleBatch, forward_mode: ForwardMode):
         if self.is_multimodal_model and forward_mode == ForwardMode.EXTEND:
             return self.forward_extend_multi_modal(batch)
         elif forward_mode == ForwardMode.DECODE:

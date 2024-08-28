@@ -335,12 +335,12 @@ def launch_server(
     pipe_detoken_reader, pipe_detoken_writer = mp.Pipe(duplex=False)
 
     if server_args.dp_size == 1:
-        start_process = start_controller_process_single
+        start_controller_process = start_controller_process_single
     else:
-        start_process = start_controller_process_multi
+        start_controller_process = start_controller_process_multi
 
     proc_controller = mp.Process(
-        target=start_process,
+        target=start_controller_process,
         args=(server_args, port_args, pipe_controller_writer, model_overide_args),
     )
     proc_controller.start()
