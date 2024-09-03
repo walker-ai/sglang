@@ -195,9 +195,9 @@ class ModelRunner:
             monkey_patch_vllm_qvk_linear_loader()
 
         self.dtype = self.vllm_model_config.dtype
-        if self.model_config.model_overide_args is not None:
+        if self.model_config.model_override_args is not None:
             self.vllm_model_config.hf_config.update(
-                self.model_config.model_overide_args
+                self.model_config.model_override_args
             )
 
         self.model = get_model(
@@ -348,13 +348,7 @@ class ModelRunner:
         if self.server_args.kv_cache_dtype == "auto":
             self.kv_cache_dtype = self.dtype
         elif self.server_args.kv_cache_dtype == "fp8_e5m2":
-            if self.server_args.disable_flashinfer or self.server_args.enable_mla:
-                logger.warning(
-                    "FP8 KV cache is not supported for Triton kernel now, using auto kv cache dtype"
-                )
-                self.kv_cache_dtype = self.dtype
-            else:
-                self.kv_cache_dtype = torch.float8_e5m2
+            self.kv_cache_dtype = torch.float8_e5m2
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
@@ -529,7 +523,7 @@ class ModelRunner:
         if (
             self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(len(batch.reqs))
-            and not batch.sampling_info.has_bias()
+            and batch.sampling_info.can_run_in_cuda_graph()
         ):
             return self.cuda_graph_runner.replay(batch)
 
