@@ -14,8 +14,8 @@ limitations under the License.
 """
 
 # Adapted from
-# https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
-"""Inference-only LLaMA model compatible with HuggingFace weights."""
+# https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/xverse.py#L1
+"""Inference-only XVERSE model compatible with HuggingFace weights."""
 
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -24,6 +24,8 @@ from torch import nn
 from transformers import LlamaConfig
 from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.model_executor.layers.activation import SiluAndMul
+from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -37,17 +39,13 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.sampler import Sampler
-from sglang.srt.layers.torchao_utils import torchao_quantize_param_data
-from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.model_executor.model_runner import InputMetadata
 
 
-class LlamaMLP(nn.Module):
+class XverseMLP(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -85,7 +83,7 @@ class LlamaMLP(nn.Module):
         return x
 
 
-class LlamaAttention(nn.Module):
+class XverseAttention(nn.Module):
     def __init__(
         self,
         config: LlamaConfig,
@@ -173,7 +171,7 @@ class LlamaAttention(nn.Module):
         return output
 
 
-class LlamaDecoderLayer(nn.Module):
+class XverseDecoderLayer(nn.Module):
     def __init__(
         self,
         config: LlamaConfig,
@@ -193,11 +191,14 @@ class LlamaDecoderLayer(nn.Module):
             )
         rope_is_neox_style = getattr(config, "rope_is_neox_style", True)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.self_attn = LlamaAttention(
+        num_kv_heads = getattr(
+            config, "num_key_value_heads", config.num_attention_heads
+        )
+        self.self_attn = XverseAttention(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
+            num_kv_heads=num_kv_heads,
             layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
@@ -206,7 +207,7 @@ class LlamaDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
-        self.mlp = LlamaMLP(
+        self.mlp = XverseMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -243,7 +244,7 @@ class LlamaDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class LlamaModel(nn.Module):
+class XverseModel(nn.Module):
     def __init__(
         self,
         config: LlamaConfig,
@@ -259,7 +260,7 @@ class LlamaModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                LlamaDecoderLayer(
+                XverseDecoderLayer(
                     config, i, quant_config=quant_config, prefix=f"model.layers.{i}"
                 )
                 for i in range(config.num_hidden_layers)
@@ -287,22 +288,23 @@ class LlamaModel(nn.Module):
                 input_metadata,
                 residual,
             )
+            # print(f"layer[{i}].hidden_states: {hidden_states}")
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
-class LlamaForCausalLM(nn.Module):
+class XverseForCausalLM(nn.Module):
     def __init__(
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
         cache_config: Optional[CacheConfig] = None,
+        efficient_weight_load=False,
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.torchao_config = global_server_args_dict["torchao_config"]
-        self.model = LlamaModel(config, quant_config=quant_config)
+        self.model = XverseModel(config, quant_config=quant_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
         self.sampler = Sampler()
@@ -316,86 +318,43 @@ class LlamaForCausalLM(nn.Module):
         positions: torch.Tensor,
         input_metadata: InputMetadata,
         input_embeds: torch.Tensor = None,
-    ) -> LogitsProcessorOutput:
+    ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
+        # print(f"{hidden_states=}")
         logits_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head.weight, input_metadata
         )
         sample_output = self.sampler(logits_output, input_metadata.sampling_info)
         return sample_output, logits_output
 
-    def get_hidden_dim(self, module_name):
-        if module_name in ["q_proj", "o_proj", "qkv_proj"]:
-            return self.config.hidden_size, self.config.hidden_size
-        elif module_name in ["kv_proj"]:
-            return self.config.hidden_size, self.config.hidden_size // (
-                self.config.num_attention_heads // self.config.num_key_value_heads
-            )
-        elif module_name == "gate_up_proj":
-            return self.config.hidden_size, self.config.intermediate_size
-        elif module_name == "down_proj":
-            return self.config.intermediate_size, self.config.hidden_size
-        else:
-            raise NotImplementedError()
-
-    def get_module_name(self, name):
-        params_mapping = {
-            "q_proj": "qkv_proj",
-            "k_proj": "qkv_proj",
-            "v_proj": "qkv_proj",
-            "gate_proj": "gate_up_proj",
-            "up_proj": "gate_up_proj",
-        }
-        return params_mapping.get(name, name)
-
-    def get_module_name_from_weight_name(self, name):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id, num_shard)
-            ("qkv_proj", "q_proj", "q", 3),
-            ("qkv_proj", "k_proj", "k", 3),
-            ("qkv_proj", "v_proj", "v", 3),
-            ("gate_up_proj", "gate_proj", 0, 2),
-            ("gate_up_proj", "up_proj", 1, 2),
-        ]
-        for param_name, weight_name, shard_id, num_shard in stacked_params_mapping:
-            if weight_name in name:
-                return (
-                    name.replace(weight_name, param_name)[: -len(".weight")],
-                    num_shard,
-                )
-        return name[: -len(".weight")], 1
-
-    def get_num_params(self):
-        params_dict = dict(self.named_parameters())
-        return len(params_dict)
-
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(
+        self, weights: Iterable[Tuple[str, torch.Tensor]], name=None, loaded_weight=None
+    ):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            (".gate_up_proj", ".gate_proj", 0),
-            (".gate_up_proj", ".up_proj", 1),
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = self.param_dict
 
-        for name, loaded_weight in weights:
+        def load_weights_per_param(name, loaded_weight):
             if "rotary_emb.inv_freq" in name or "projector" in name:
-                continue
+                return
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
                 # Models trained using ColossalAI may include these tensors in
                 # the checkpoint. Skip them.
-                continue
-            if name.startswith("model.vision_tower") and name not in params_dict:
-                continue
-
+                return
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name.startswith("model.vision_tower") and name not in params_dict:
                     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -404,33 +363,18 @@ class LlamaForCausalLM(nn.Module):
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
-                    continue
+                    return
+                if name.startswith("model.vision_tower") and name not in params_dict:
+                    return
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
-                if self.torchao_config:
-                    if name.endswith("proj.weight") and param.ndim == 2:
-                        params_dict[name] = torchao_quantize_param_data(
-                            param, self.torchao_config
-                        )
-
-        if self.torchao_config:
-            # quantizing the loaded, stacked params, e.g. "...qkv_proj"
-            stacked_params = set(entry[0] for entry in stacked_params_mapping)
-            for param_suffix in stacked_params:
-                for name in params_dict:
-                    if param_suffix in name:
-                        param = params_dict[name]
-                        params_dict[name] = torchao_quantize_param_data(
-                            param, self.torchao_config
-                        )
-
-            self.load_state_dict(params_dict, assign=True)
+        if name is None or loaded_weight is None:
+            for name, loaded_weight in weights:
+                load_weights_per_param(name, loaded_weight)
+        else:
+            load_weights_per_param(name, loaded_weight)
 
 
-class Phi3ForCausalLM(LlamaForCausalLM):
-    pass
-
-
-EntryClass = [LlamaForCausalLM, Phi3ForCausalLM]
+EntryClass = XverseForCausalLM
