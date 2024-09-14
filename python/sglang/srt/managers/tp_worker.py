@@ -547,8 +547,9 @@ class ModelTpServer:
         if self.model_runner.is_generation:
             # Forward and sample the next tokens
             if batch.extend_num_tokens != 0:
-                sample_output, logits_output = self.model_runner.forward(batch)
-                next_token_ids = batch.check_sample_results(sample_output)
+                logits_output = self.model_runner.forward(batch)
+                next_token_ids = self.model_runner.sample(logits_output, batch)
+
                 batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                     next_token_ids
                 )
@@ -723,8 +724,8 @@ class ModelTpServer:
         batch.prepare_for_decode()
 
         # Forward and sample the next tokens
-        sample_output, logits_output = self.model_runner.forward(batch)
-        next_token_ids = batch.check_sample_results(sample_output)
+        logits_output = self.model_runner.forward(batch)
+        next_token_ids = self.model_runner.sample(logits_output, batch)
         batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
             next_token_ids
         )
@@ -813,7 +814,11 @@ class ModelTpServer:
                         "prompt_tokens": len(req.origin_input_ids),
                         "completion_tokens": len(req.output_ids),
                         "completion_tokens_wo_jump_forward": req.completion_tokens_wo_jump_forward,
-                        "finish_reason": str(req.finished_reason),
+                        "finish_reason": (
+                            req.finished_reason.to_json()
+                            if req.finished_reason is not None
+                            else None
+                        ),
                     }
                     if req.return_logprob:
                         (
