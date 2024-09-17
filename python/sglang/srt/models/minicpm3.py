@@ -19,7 +19,6 @@ import math
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
-from flashinfer import bmm_fp8
 from torch import nn
 from transformers import PretrainedConfig
 from vllm.config import CacheConfig
@@ -44,6 +43,11 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.utils import is_hip
+
+# ROCm: flashinfer available later
+if not is_hip():
+    from flashinfer import bmm_fp8
 
 
 class MiniCPM3MLP(nn.Module):
@@ -415,7 +419,7 @@ class MiniCPM3DecoderLayer(nn.Module):
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        if global_server_args_dict["enable_mla"]:
+        if not global_server_args_dict["disable_mla"]:
             self.self_attn = MiniCPM3AttentionMLA(
                 config=config,
                 hidden_size=self.hidden_size,
@@ -649,7 +653,7 @@ class MiniCPM3ForCausalLM(nn.Module):
                     )
                     weight_loader(param, loaded_weight)
 
-        if global_server_args_dict["enable_mla"]:
+        if not global_server_args_dict["disable_mla"]:
             for layer_id in range(self.config.num_hidden_layers):
                 self_attn = self.model.layers[layer_id].self_attn
                 w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(
