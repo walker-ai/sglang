@@ -1,8 +1,6 @@
 import unittest
 from types import SimpleNamespace
 
-import requests
-
 from sglang.srt.utils import kill_child_process
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -13,7 +11,7 @@ from sglang.test.test_utils import (
 )
 
 
-class TestTorchCompile(unittest.TestCase):
+class TestPyTorchSamplingBackend(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
@@ -22,7 +20,7 @@ class TestTorchCompile(unittest.TestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--torchao-config", "int4wo-128"],
+            other_args=["--sampling-backend", "pytorch"],
         )
 
     @classmethod
@@ -39,34 +37,7 @@ class TestTorchCompile(unittest.TestCase):
         )
 
         metrics = run_eval(args)
-        assert metrics["score"] >= 0.60
-
-    def run_decode(self, max_new_tokens):
-        response = requests.post(
-            self.base_url + "/generate",
-            json={
-                "text": "The capital of France is",
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": max_new_tokens,
-                },
-                "ignore_eos": True,
-            },
-        )
-        return response.json()
-
-    def test_throughput(self):
-        import time
-
-        max_tokens = 256
-
-        tic = time.time()
-        res = self.run_decode(max_tokens)
-        tok = time.time()
-        print(res["text"])
-        throughput = max_tokens / (tok - tic)
-        print(f"Throughput: {throughput} tokens/s")
-        assert throughput >= 210
+        assert metrics["score"] >= 0.65
 
 
 if __name__ == "__main__":

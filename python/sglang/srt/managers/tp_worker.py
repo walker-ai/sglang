@@ -198,6 +198,7 @@ class ModelTpServer:
                     "trust_remote_code": server_args.trust_remote_code,
                 },
                 skip_tokenizer_init=server_args.skip_tokenizer_init,
+                constrained_json_whitespace_pattern=server_args.constrained_json_whitespace_pattern,
             )
         self.jump_forward_cache = JumpForwardCache()
 
@@ -278,7 +279,7 @@ class ModelTpServer:
                         self.running_batch = None
                         break
 
-                    if self.out_pyobjs and self.running_batch.has_stream():
+                    if self.out_pyobjs and self.running_batch.has_stream:
                         break
             else:
                 self.check_memory()
@@ -360,9 +361,13 @@ class ModelTpServer:
             # Only when pixel values is not None we have modalities
             req.modalities = recv_req.modalites
         req.return_logprob = recv_req.return_logprob
-        req.logprob_start_len = recv_req.logprob_start_len
         req.top_logprobs_num = recv_req.top_logprobs_num
         req.stream = recv_req.stream
+        req.logprob_start_len = recv_req.logprob_start_len
+
+        if req.logprob_start_len == -1:
+            # By default, only return the logprobs for output tokens
+            req.logprob_start_len = len(recv_req.input_ids) - 1
 
         # Init regex FSM
         if (
@@ -384,7 +389,7 @@ class ModelTpServer:
 
         # Truncate prompts that are too long
         if len(req.origin_input_ids) >= self.max_req_input_len:
-            logger.warn(
+            logger.warning(
                 "Request length is longer than the KV cache pool size or "
                 "the max context length. Truncated!!!"
             )
@@ -410,7 +415,7 @@ class ModelTpServer:
 
         # Truncate prompts that are too long
         if len(req.origin_input_ids) >= self.max_req_input_len:
-            logger.warn(
+            logger.warning(
                 "Request length is longer than the KV cache pool size or "
                 "the max context length. Truncated!!!"
             )
@@ -583,7 +588,7 @@ class ModelTpServer:
                     next_token_ids = [self.tokenizer.eos_token_id] * len(batch.reqs)
 
             # Check finish conditions
-            pt = 0
+            logprob_pt = 0
             for i, req in enumerate(batch.reqs):
                 if req is not self.current_inflight_req:
                     # Inflight reqs' prefill is not finished
@@ -607,10 +612,9 @@ class ModelTpServer:
                     self.req_to_token_pool.free(req.req_pool_idx)
 
                 if req.return_logprob:
-                    self.add_logprob_return_values(
-                        i, req, pt, next_token_ids, logits_output
+                    logprob_pt += self.add_logprob_return_values(
+                        i, req, logprob_pt, next_token_ids, logits_output
                     )
-                    pt += req.extend_input_len
         else:
             assert batch.extend_num_tokens != 0
             logits_output = self.model_runner.forward(batch)
@@ -638,47 +642,62 @@ class ModelTpServer:
 
     def add_logprob_return_values(
         self,
-        i,
+        i: int,
         req: Req,
         pt: int,
         next_token_ids: List[int],
         output: LogitsProcessorOutput,
     ):
+        """Attach logprobs to the return values."""
+        req.output_token_logprobs.append(
+            (output.next_token_logprobs[i], next_token_ids[i])
+        )
+
+        # If logprob_start_len > 0, then first logprob_start_len prompt tokens will be ignored.
+        num_input_logprobs = req.extend_input_len - req.extend_logprob_start_len
+
         if req.normalized_prompt_logprob is None:
             req.normalized_prompt_logprob = output.normalized_prompt_logprobs[i]
 
         if req.input_token_logprobs is None:
-            # If logprob_start_len > 0, then first logprob_start_len prompt tokens will be ignored.
-            req.input_token_logprobs = list(
-                zip(
-                    output.input_token_logprobs[pt : pt + req.extend_input_len - 1],
-                    req.fill_ids[-req.extend_input_len + 1 :],
-                )
-            )
-            if req.logprob_start_len == 0:
+            input_token_logprobs = output.input_token_logprobs[
+                pt : pt + num_input_logprobs - 1 - req.last_update_decode_tokens
+            ]
+            input_token_ids = req.fill_ids[
+                len(req.fill_ids)
+                - num_input_logprobs
+                + 1 : len(req.fill_ids)
+                - req.last_update_decode_tokens
+            ]
+            req.input_token_logprobs = list(zip(input_token_logprobs, input_token_ids))
+
+            if (
+                req.logprob_start_len == 0
+            ):  # The first token does not have logprob, pad it.
                 req.input_token_logprobs = [
                     (None, req.fill_ids[0])
                 ] + req.input_token_logprobs
 
         if req.last_update_decode_tokens != 0:
+            # Some decode tokens are re-computed in an extend batch
             req.output_token_logprobs.extend(
                 list(
                     zip(
                         output.input_token_logprobs[
                             pt
-                            + req.extend_input_len
+                            + num_input_logprobs
+                            - 1
                             - req.last_update_decode_tokens : pt
-                            + req.extend_input_len
+                            + num_input_logprobs
                             - 1
                         ],
-                        req.fill_ids[-req.last_update_decode_tokens + 1 :],
+                        req.fill_ids[
+                            len(req.fill_ids)
+                            - req.last_update_decode_tokens : len(req.fill_ids)
+                        ],
                     )
                 )
             )
-
-        req.output_token_logprobs.append(
-            (output.next_token_logprobs[i], next_token_ids[i])
-        )
 
         if req.top_logprobs_num > 0:
             if req.input_top_logprobs is None:
@@ -688,9 +707,11 @@ class ModelTpServer:
 
             if req.last_update_decode_tokens != 0:
                 req.output_top_logprobs.extend(
-                    output.input_top_logprobs[i][-req.last_update_decode_tokens + 1 :]
+                    output.input_top_logprobs[i][-req.last_update_decode_tokens :]
                 )
             req.output_top_logprobs.append(output.output_top_logprobs[i])
+
+        return num_input_logprobs
 
     def forward_decode_batch(self, batch: ScheduleBatch):
         # Check if decode out of memory
@@ -787,12 +808,10 @@ class ModelTpServer:
                 unfinished_indices.append(i)
 
             if req.finished() or (
-                (
-                    req.stream
-                    and (
-                        self.decode_forward_ct % self.stream_interval == 0
-                        or len(req.output_ids) == 1
-                    )
+                req.stream
+                and (
+                    self.decode_forward_ct % self.stream_interval == 0
+                    or len(req.output_ids) == 1
                 )
             ):
                 output_rids.append(req.rid)
@@ -917,6 +936,8 @@ class ModelTpServer:
         if success:
             flash_cache_success = self.flush_cache()
             assert flash_cache_success, "Cache flush failed after updating weights"
+        else:
+            logger.error(message)
         return success, message
 
 
