@@ -26,14 +26,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.linear import (
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -44,10 +37,15 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from sglang.srt.configs.glm import GLMConfig
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.sampler import Sampler
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 LoraConfig = None
 
@@ -160,12 +158,12 @@ class GLMAttention(nn.Module):
             self,
             positions: torch.Tensor,
             hidden_states: torch.Tensor,
-            input_metadata: InputMetadata,
+            forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.query_key_value(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        context_layer = self.attn(q, k, v, input_metadata)
+        context_layer = self.attn(q, k, v, forward_batch)
         attn_output, _ = self.dense(context_layer)
         return attn_output
 
@@ -203,23 +201,26 @@ class GLMBlock(nn.Module):
             self,
             positions: torch.Tensor,
             hidden_states: torch.Tensor,
-            input_metadata: InputMetadata,
+            forward_batch: ForwardBatch,
+            residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        attn_output = self.attention(
+        # Self Attention
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        hidden_states = self.attention(
             positions=positions,
             hidden_states=hidden_states,
-            input_metadata=input_metadata,
+            forward_batch=forward_batch,
         )
-        # residual connection
-        hidden_states = attn_output + residual
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        feed_forward_hidden_states = self.mlp(hidden_states)
-        # residual connection
-        hidden_states = residual + feed_forward_hidden_states
-        return hidden_states
+
+        # Fully Connected
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
 
 
 class GLMModel(nn.Module):
@@ -255,20 +256,21 @@ class GLMModel(nn.Module):
             self,
             input_ids: torch.Tensor,
             positions: torch.Tensor,
-            input_metadata: InputMetadata,
+            forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         hidden_states = self.word_embeddings(input_ids)
         # hidden_states = self.embedding_dropout(hidden_states)
-
+        residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
-            hidden_states = layer(
+            hidden_states, residual = layer(
                 positions,
                 hidden_states,
-                input_metadata,
+                forward_batch,
+                residual,
             )
 
-        hidden_states = self.final_layernorm(hidden_states)
+        hidden_states, _ = self.final_layernorm(hidden_states, residual)
         return hidden_states
 
 
@@ -277,7 +279,7 @@ class GLMForCausalLM(nn.Module):
             self,
             config: GLMConfig,
             quant_config: Optional[QuantizationConfig] = None,
-            cache_config: Optional[CacheConfig] = None,
+            cache_config=None,
     ):
         super().__init__()
         self.config = config
@@ -285,22 +287,19 @@ class GLMForCausalLM(nn.Module):
         self.transformer = GLMModel(config, quant_config)
         self.lm_head = self.transformer.lm_head
         self.logits_processor = LogitsProcessor(config)
-        self.sampler = Sampler()
 
     @torch.no_grad()
     def forward(
             self,
             input_ids: torch.Tensor,
             positions: torch.Tensor,
-            input_metadata: InputMetadata,
+            forward_batch: ForwardBatch,
             input_embeds: torch.Tensor = None,
-    ) -> LogitsProcessorOutput:
-        hidden_states = self.transformer(input_ids, positions, input_metadata)
-        logits_output = self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, input_metadata
+    ) -> torch.Tensor:
+        hidden_states = self.transformer(input_ids, positions, forward_batch)
+        return self.logits_processor(
+            input_ids, hidden_states, self.lm_head.weight, forward_batch
         )
-        sample_output = self.sampler(logits_output, input_metadata.sampling_info)
-        return sample_output, logits_output
 
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -362,6 +361,13 @@ class GLMForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
+# class GLMForConditionalGeneration(GLMForCausalLM):
+#     pass
 
-EntryClass = GLMForCausalLM
-EntryClassRemapping = [("GLMForConditionalGeneration", GLMForCausalLM), ("GLMModel", GLMForCausalLM)]
+# class GLMModel(GLMForCausalLM):
+#     pass
+
+# EntryClass = [GLMForCausalLM, GLMForConditionalGeneration, GLMModel]
+
+EntryClass = [GLMForCausalLM]
+
