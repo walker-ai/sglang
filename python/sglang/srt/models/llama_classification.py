@@ -18,12 +18,11 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import LlamaConfig
-from vllm.config import CacheConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
 
 
@@ -32,7 +31,7 @@ class LlamaForClassification(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -50,18 +49,18 @@ class LlamaForClassification(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, input_metadata, input_embeds)
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         is_eos_token = input_ids == self.eos_token_id
         hidden_states = hidden_states[is_eos_token]
         scores = self.classification_head(hidden_states)
 
-        if scores.shape[0] != input_metadata.batch_size:
+        if scores.shape[0] != forward_batch.batch_size:
             print("Warning: the EOS tokens are missing in some sentences.")
             scores = torch.ones(
-                (input_metadata.batch_size, self.config.classification_out_size)
+                (forward_batch.batch_size, self.config.classification_out_size)
             ).to(input_ids.device)
 
         logits_output = LogitsProcessorOutput(

@@ -19,9 +19,10 @@ import argparse
 import dataclasses
 import logging
 import random
-from typing import List, Optional, Union
+import tempfile
+from typing import List, Optional
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_flashinfer_available, is_ipv6, is_port_available
 
 logger = logging.getLogger(__name__)
 
@@ -34,11 +35,12 @@ class ServerArgs:
     tokenizer_mode: str = "auto"
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
+    trust_remote_code: bool = True
     dtype: str = "auto"
     kv_cache_dtype: str = "auto"
-    trust_remote_code: bool = True
-    context_length: Optional[int] = None
     quantization: Optional[str] = None
+    context_length: Optional[int] = None
+    device: str = "cuda"
     served_model_name: Optional[str] = None
     chat_template: Optional[str] = None
     is_embedding: bool = False
@@ -46,7 +48,6 @@ class ServerArgs:
     # Port
     host: str = "127.0.0.1"
     port: int = 30000
-    additional_ports: Optional[Union[List[int], int]] = None
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
@@ -72,23 +73,39 @@ class ServerArgs:
     # Other
     api_key: Optional[str] = None
     file_storage_pth: str = "SGLang_storage"
+    enable_cache_report: bool = False
+    watchdog_timeout: float = 600
 
     # Data parallelism
     dp_size: int = 1
     load_balance_method: str = "round_robin"
 
     # Distributed args
-    nccl_init_addr: Optional[str] = None
+    dist_init_addr: Optional[str] = None
     nnodes: int = 1
-    node_rank: Optional[int] = None
+    node_rank: int = 0
 
     # Model override args in JSON
     json_model_override_args: str = "{}"
 
-    # Optimization/debug options
+    # Double Sparsity
+    enable_double_sparsity: bool = False
+    ds_channel_config_path: str = None
+    ds_heavy_channel_num: int = 32
+    ds_heavy_token_num: int = 256
+    ds_heavy_channel_type: str = "qk"
+    ds_sparse_decode_threshold: int = 4096
+
+    # LoRA
+    lora_paths: Optional[List[str]] = None
+    max_loras_per_batch: int = 8
+
+    # Kernel backend
     attention_backend: Optional[str] = None
     sampling_backend: Optional[str] = None
+    grammar_backend: Optional[str] = "outlines"
 
+    # Optimization/debug options
     disable_flashinfer: bool = False
     disable_flashinfer_sampling: bool = False
     disable_radix_cache: bool = False
@@ -98,16 +115,17 @@ class ServerArgs:
     disable_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
     disable_mla: bool = False
+    disable_penalizer: bool = False
+    disable_nan_detection: bool = False
+    enable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_torch_compile: bool = False
-    max_torch_compile_bs: int = 32
+    torch_compile_max_bs: int = 32
+    cuda_graph_max_bs: int = 160
     torchao_config: str = ""
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
-
-    # LoRA
-    lora_paths: Optional[List[str]] = None
-    max_loras_per_batch: int = 8
+    num_continuous_decode_steps: int = 1
 
     def __post_init__(self):
         # Set missing default values
@@ -134,11 +152,6 @@ class ServerArgs:
             else:
                 self.mem_fraction_static = 0.88
 
-        if isinstance(self.additional_ports, int):
-            self.additional_ports = [self.additional_ports]
-        elif self.additional_ports is None:
-            self.additional_ports = []
-
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
 
@@ -156,8 +169,7 @@ class ServerArgs:
             )
             self.sampling_backend = "pytorch"
 
-        # ROCm: flashinfer available later
-        if is_hip():
+        if not is_flashinfer_available():
             self.attention_backend = "triton"
             self.sampling_backend = "pytorch"
 
@@ -167,6 +179,16 @@ class ServerArgs:
 
         if self.sampling_backend is None:
             self.sampling_backend = "flashinfer"
+
+        if self.enable_overlap_schedule:
+            logger.warning(
+                "Overlap scheduler mode is enabled. This is an experimental feature. "
+                "Sampling penalizer (e.g., frequency and repetition penalty), constrained decoding (e.g., regex, JSON), "
+                "and embedding APIs are not supported and will lead to wrong results. "
+                "The NaN detection is also disabled."
+            )
+            self.disable_penalizer = True
+            self.disable_nan_detection = True
 
         # Model-specific patches
         if "Alibaba-NLP/gte-Qwen2-1.5B-instruct" == self.model_path:
@@ -200,13 +222,6 @@ class ServerArgs:
             "--port", type=int, default=ServerArgs.port, help="The port of the server."
         )
         parser.add_argument(
-            "--additional-ports",
-            type=int,
-            nargs="*",
-            default=[],
-            help="The additional ports specified for the server.",
-        )
-        parser.add_argument(
             "--tokenizer-mode",
             type=str,
             default=ServerArgs.tokenizer_mode,
@@ -237,6 +252,11 @@ class ServerArgs:
             "which is mainly for profiling.",
         )
         parser.add_argument(
+            "--trust-remote-code",
+            action="store_true",
+            help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
+        )
+        parser.add_argument(
             "--dtype",
             type=str,
             default=ServerArgs.dtype,
@@ -258,17 +278,6 @@ class ServerArgs:
             help='Data type for kv cache storage. "auto" will use model data type. "fp8_e5m2" is supported for CUDA 11.8+.',
         )
         parser.add_argument(
-            "--trust-remote-code",
-            action="store_true",
-            help="Whether or not to allow for custom models defined on the Hub in their own modeling files.",
-        )
-        parser.add_argument(
-            "--context-length",
-            type=int,
-            default=ServerArgs.context_length,
-            help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead).",
-        )
-        parser.add_argument(
             "--quantization",
             type=str,
             default=ServerArgs.quantization,
@@ -279,10 +288,22 @@ class ServerArgs:
                 "marlin",
                 "gptq_marlin",
                 "awq_marlin",
-                "squeezellm",
                 "bitsandbytes",
             ],
             help="The quantization method.",
+        )
+        parser.add_argument(
+            "--context-length",
+            type=int,
+            default=ServerArgs.context_length,
+            help="The model's maximum context length. Defaults to None (will use the value from the model's config.json instead).",
+        )
+        parser.add_argument(
+            "--device",
+            type=str,
+            default="cuda",
+            choices=["cuda", "xpu"],
+            help="The device type.",
         )
         parser.add_argument(
             "--served-model-name",
@@ -404,6 +425,17 @@ class ServerArgs:
             default=ServerArgs.file_storage_pth,
             help="The path of the file storage in backend.",
         )
+        parser.add_argument(
+            "--enable-cache-report",
+            action="store_true",
+            help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
+        )
+        parser.add_argument(
+            "--watchdog-timeout",
+            type=float,
+            default=ServerArgs.watchdog_timeout,
+            help="Set watchdog timeout in seconds. If a forward batch takes longer than this, the server will crash to prevent hanging.",
+        )
 
         # Data parallelism
         parser.add_argument(
@@ -426,14 +458,17 @@ class ServerArgs:
 
         # Multi-node distributed serving args
         parser.add_argument(
-            "--nccl-init-addr",
+            "--dist-init-addr",
+            "--nccl-init-addr",  # For backward compatbility. This will be removed in the future.
             type=str,
-            help="The nccl init address of multi-node server.",
+            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`).",
         )
         parser.add_argument(
             "--nnodes", type=int, default=ServerArgs.nnodes, help="The number of nodes."
         )
-        parser.add_argument("--node-rank", type=int, help="The node rank.")
+        parser.add_argument(
+            "--node-rank", type=int, default=ServerArgs.node_rank, help="The node rank."
+        )
 
         # Model override args
         parser.add_argument(
@@ -443,7 +478,60 @@ class ServerArgs:
             default=ServerArgs.json_model_override_args,
         )
 
-        # Optimization/debug options
+        # Double Sparsity
+        parser.add_argument(
+            "--enable-double-sparsity",
+            action="store_true",
+            help="Enable double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-channel-config-path",
+            type=str,
+            default=ServerArgs.ds_channel_config_path,
+            help="The path of the double sparsity channel config",
+        )
+        parser.add_argument(
+            "--ds-heavy-channel-num",
+            type=int,
+            default=ServerArgs.ds_heavy_channel_num,
+            help="The number of heavy channels in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-heavy-token-num",
+            type=int,
+            default=ServerArgs.ds_heavy_token_num,
+            help="The number of heavy tokens in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-heavy-channel-type",
+            type=str,
+            default=ServerArgs.ds_heavy_channel_type,
+            help="The type of heavy channels in double sparsity attention",
+        )
+        parser.add_argument(
+            "--ds-sparse-decode-threshold",
+            type=int,
+            default=ServerArgs.ds_sparse_decode_threshold,
+            help="The type of heavy channels in double sparsity attention",
+        )
+
+        # LoRA
+        parser.add_argument(
+            "--lora-paths",
+            type=str,
+            nargs="*",
+            default=None,
+            action=LoRAPathAction,
+            help="The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}",
+        )
+        parser.add_argument(
+            "--max-loras-per-batch",
+            type=int,
+            default=8,
+            help="Maximum number of adapters for a running batch, include base-only request",
+        )
+
+        # Kernel backend
         parser.add_argument(
             "--attention-backend",
             type=str,
@@ -458,6 +546,15 @@ class ServerArgs:
             default=ServerArgs.sampling_backend,
             help="Choose the kernels for sampling layers.",
         )
+        parser.add_argument(
+            "--grammar-backend",
+            type=str,
+            choices=["xgrammar", "outlines"],
+            default=ServerArgs.grammar_backend,
+            help="Choose the backend for constrained decoding.",
+        )
+
+        # Optimization/debug options
         parser.add_argument(
             "--disable-flashinfer",
             action="store_true",
@@ -505,6 +602,21 @@ class ServerArgs:
             help="Disable Multi-head Latent Attention (MLA) for DeepSeek-V2.",
         )
         parser.add_argument(
+            "--disable-penalizer",
+            action="store_true",
+            help="Disable the logit penalizers (e.g., frequency and repetition penalty) for better performance if they are not used in any requests.",
+        )
+        parser.add_argument(
+            "--disable-nan-detection",
+            action="store_true",
+            help="Disable the NaN detection for better performance.",
+        )
+        parser.add_argument(
+            "--enable-overlap-schedule",
+            action="store_true",
+            help="Overlap the CPU scheduler with GPU model worker. Experimental feature.",
+        )
+        parser.add_argument(
             "--enable-mixed-chunk",
             action="store_true",
             help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
@@ -515,10 +627,16 @@ class ServerArgs:
             help="Optimize the model with torch.compile. Experimental feature.",
         )
         parser.add_argument(
-            "--max-torch-compile-bs",
+            "--torch-compile-max-bs",
             type=int,
-            default=ServerArgs.max_torch_compile_bs,
+            default=ServerArgs.torch_compile_max_bs,
             help="Set the maximum batch size when using torch compile.",
+        )
+        parser.add_argument(
+            "--cuda-graph-max-bs",
+            type=int,
+            default=ServerArgs.cuda_graph_max_bs,
+            help="Set the maximum batch size for cuda graph.",
         )
         parser.add_argument(
             "--torchao-config",
@@ -538,25 +656,12 @@ class ServerArgs:
             "This only affects Triton attention kernels.",
         )
         parser.add_argument(
-            "--efficient-weight-load",
-            action="store_true",
-            help="Turn on memory efficient weight loading with quantization (quantize per layer during loading).",
-        )
-
-        # LoRA options
-        parser.add_argument(
-            "--lora-paths",
-            type=str,
-            nargs="*",
-            default=None,
-            action=LoRAPathAction,
-            help="The list of LoRA adapters. You can provide a list of either path in str or renamed path in the format {name}={path}",
-        )
-        parser.add_argument(
-            "--max-loras-per-batch",
+            "--num-continuous-decode-steps",
             type=int,
-            default=8,
-            help="Maximum number of adapters for a running batch, include base-only request",
+            default=ServerArgs.num_continuous_decode_steps,
+            help="Run multiple continuous decoding steps to reduce scheduling overhead. "
+            "This can potentially increase throughput but may also increase time-to-first-token latency. "
+            "The default value is 1, meaning only run one decoding step at a time.",
         )
 
     @classmethod
@@ -567,14 +672,17 @@ class ServerArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):
-        return f"http://{self.host}:{self.port}"
+        if is_ipv6(self.host):
+            return f"http://[{self.host}]:{self.port}"
+        else:
+            return f"http://{self.host}:{self.port}"
 
     def check_server_args(self):
         assert (
             self.tp_size % self.nnodes == 0
         ), "tp_size must be divisible by number of nodes"
         assert not (
-            self.dp_size > 1 and self.node_rank is not None
+            self.dp_size > 1 and self.nnodes != 1
         ), "multi-node data parallel is not supported"
         assert (
             self.max_loras_per_batch > 0
@@ -582,6 +690,16 @@ class ServerArgs:
             and (self.lora_paths is None or self.disable_cuda_graph)
             and (self.lora_paths is None or self.disable_radix_cache)
         ), "compatibility of lora and cuda graph and radix attention is in progress"
+
+        if isinstance(self.lora_paths, list):
+            lora_paths = self.lora_paths
+            self.lora_paths = {}
+            for lora_path in lora_paths:
+                if "=" in lora_path:
+                    name, path = lora_path.split("=", 1)
+                    self.lora_paths[name] = path
+                else:
+                    self.lora_paths[lora_path] = lora_path
 
 
 def prepare_server_args(argv: List[str]) -> ServerArgs:
@@ -604,10 +722,30 @@ def prepare_server_args(argv: List[str]) -> ServerArgs:
 
 @dataclasses.dataclass
 class PortArgs:
-    tokenizer_port: int
-    controller_port: int
-    detokenizer_port: int
-    nccl_ports: List[int]
+    # The ipc filename for tokenizer to receive inputs from detokenizer (zmq)
+    tokenizer_ipc_name: str
+    # The ipc filename for scheduler (rank 0) to receive inputs from tokenizer (zmq)
+    scheduler_input_ipc_name: str
+    # The ipc filename for detokenizer to receive inputs from scheduler (zmq)
+    detokenizer_ipc_name: str
+
+    # The port for nccl initialization (torch.dist)
+    nccl_port: int
+
+    @staticmethod
+    def init_new(server_args) -> "PortArgs":
+        port = server_args.port + 42
+        while True:
+            if is_port_available(port):
+                break
+            port += 42
+
+        return PortArgs(
+            tokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
+            scheduler_input_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
+            detokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
+            nccl_port=port,
+        )
 
 
 class LoRAPathAction(argparse.Action):

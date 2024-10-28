@@ -22,7 +22,6 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 from torch.nn import LayerNorm
-from vllm.config import CacheConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -42,7 +41,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 LoraConfig = None
 
@@ -52,7 +51,7 @@ class GLMAttention(nn.Module):
         self,
         config,
         layer_id: int = 0,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -118,7 +117,7 @@ class GLMAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.query_key_value(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -127,7 +126,7 @@ class GLMAttention(nn.Module):
             q,
             k,
             v,
-            input_metadata,
+            forward_batch,
         )
         attn_output, _ = self.dense(context_layer)
         return attn_output
@@ -188,7 +187,7 @@ class GLMBlock(nn.Module):
         self,
         config,
         layer_id: int,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -220,7 +219,7 @@ class GLMBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         # hidden_states: [num_tokens, h]
         # Layer norm at the beginning of the transformer layer.
@@ -229,7 +228,7 @@ class GLMBlock(nn.Module):
         attention_output = self.self_attention(
             hidden_states=layernorm_output,
             position_ids=position_ids,
-            input_metadata=input_metadata,
+            forward_batch=forward_batch,
         )
 
         # Residual connection.
@@ -260,7 +259,7 @@ class GLMTransformer(nn.Module):
     def __init__(
         self,
         config,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -288,14 +287,14 @@ class GLMTransformer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         for i in range(self.num_layers):
             layer = self.layers[i]
             hidden_states = layer(
                 hidden_states=hidden_states,
                 position_ids=position_ids,
-                input_metadata=input_metadata,
+                forward_batch=forward_batch,
             )
         # Final layer norm.
         if self.post_layer_norm:
@@ -304,11 +303,11 @@ class GLMTransformer(nn.Module):
         return hidden_states
 
 
-class ChatGLMModel(nn.Module):
+class ChatGLMM(nn.Module):
     def __init__(
         self,
         config,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
@@ -328,7 +327,7 @@ class ChatGLMModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         inputs_embeds = self.embedding(input_ids)
 
@@ -336,7 +335,7 @@ class ChatGLMModel(nn.Module):
         hidden_states = self.encoder(
             hidden_states=inputs_embeds,
             position_ids=position_ids,
-            input_metadata=input_metadata,
+            forward_batch=forward_batch,
         )
         return hidden_states
 
@@ -359,7 +358,7 @@ class ChatGLMForCausalLM(nn.Module):
     def __init__(
         self,
         config: ChatGLMConfig,
-        cache_config: Optional[CacheConfig] = None,
+        cache_config=None,
         quant_config: Optional[QuantizationConfig] = None,
         lora_config: Optional[LoraConfig] = None,
     ):
@@ -367,7 +366,7 @@ class ChatGLMForCausalLM(nn.Module):
         self.config: ChatGLMConfig = config
         self.quant_config = quant_config
         self.max_position_embeddings = getattr(config, "max_sequence_length", 8192)
-        self.transformer = ChatGLMModel(config, cache_config, quant_config)
+        self.transformer = ChatGLMM(config, cache_config, quant_config)
         self.lm_head = self.transformer.output_layer
         self.logits_processor = LogitsProcessor(config)
 
@@ -376,11 +375,11 @@ class ChatGLMForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        input_metadata: InputMetadata,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        hidden_states = self.transformer(input_ids, positions, input_metadata)
+        hidden_states = self.transformer(input_ids, positions, forward_batch)
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, input_metadata
+            input_ids, hidden_states, self.lm_head.weight, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -402,4 +401,4 @@ class ChatGLMModel(ChatGLMForCausalLM):
     pass
 
 
-EntryClass = [ChatGLMForCausalLM, ChatGLMModel]
+EntryClass = [ChatGLMModel]

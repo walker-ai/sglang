@@ -70,6 +70,9 @@ class Conversation:
     sep2: str = None
     # Stop criteria (the default one is EOS token)
     stop_str: Union[str, List[str]] = None
+    # The string that represents an image token in the prompt
+    image_token: str = "<image>"
+
     image_data: Optional[List[str]] = None
     modalities: Optional[List[str]] = None
 
@@ -334,6 +337,7 @@ class Conversation:
             sep=self.sep,
             sep2=self.sep2,
             stop_str=self.stop_str,
+            image_token=self.image_token,
         )
 
     def dict(self):
@@ -381,6 +385,7 @@ def generate_chat_conv(
         stop_str=conv.stop_str,
         image_data=[],
         modalities=[],
+        image_token=conv.image_token,
     )
 
     if isinstance(request.messages, str):
@@ -412,9 +417,13 @@ def generate_chat_conv(
                         num_image_url += 1
                         conv.modalities.append(content.modalities)
                 if num_image_url > 1:
-                    image_token = "<image>"
+                    image_token = conv.image_token
                 else:
-                    image_token = "<image>\n"
+                    image_token = (
+                        conv.image_token + "\n"
+                        if conv.name != "qwen2-vl"
+                        else conv.image_token
+                    )
                 for content in message.content:
                     if content.type == "text":
                         if num_image_url > 16:
@@ -502,6 +511,19 @@ register_conv_template(
 
 register_conv_template(
     Conversation(
+        name="llama_3_vision",
+        system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
+        system_template="<|start_header_id|>system<|end_header_id|>\n\n{system_message}<|eot_id|>",
+        roles=("user", "assistant"),
+        sep_style=SeparatorStyle.LLAMA3,
+        sep="",
+        stop_str=["<|end_of_text|>", "<|eot_id|>"],
+        image_token="<|image|>",
+    )
+)
+
+register_conv_template(
+    Conversation(
         name="llava_llama_3",
         system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
         system_template="<|start_header_id|>system<|end_header_id|>\n\n{system_message}<|eot_id|>",
@@ -519,5 +541,19 @@ register_conv_template(
         roles=("<|im_start|>user", "<|im_start|>assistant"),
         sep="\n",
         stop_str=["<|im_end|>", "<|action_end|>"],
+    )
+)
+
+# Reference: https://huggingface.co/docs/transformers/main/model_doc/qwen2_vl#usage-example
+register_conv_template(
+    Conversation(
+        name="qwen2-vl",
+        system_message="You are a helpful assistant.",
+        system_template="<|im_start|>system\n{system_message}",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=["<|im_end|>"],
+        image_token="<|vision_start|><|image_pad|><|vision_end|>",
     )
 )

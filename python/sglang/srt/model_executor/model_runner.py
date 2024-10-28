@@ -18,10 +18,11 @@ limitations under the License.
 import gc
 import importlib
 import importlib.resources
+import json
 import logging
 import pkgutil
 from functools import lru_cache
-from typing import Optional, Tuple, Type
+from typing import Optional, Type
 
 import torch
 import torch.nn as nn
@@ -38,23 +39,31 @@ from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import ModelRegistry
 
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig
-from sglang.srt.layers.attention_backend import FlashInferAttnBackend, TritonAttnBackend
+from sglang.srt.constrained import disable_cache
+from sglang.srt.layers.attention.double_sparsity_backend import DoubleSparseAttnBackend
+from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.lora.lora_manager import LoRAManager
-from sglang.srt.managers.schedule_batch import ScheduleBatch, global_server_args_dict
+from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import (
+    DoubleSparseTokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.model_executor.forward_batch_info import InputMetadata
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import (
+    enable_show_time_cost,
     get_available_gpu_memory,
+    is_attention_free_model,
+    is_embedding_model,
     is_generation_model,
     is_multimodal_model,
+    model_has_inner_state,
     monkey_patch_vllm_dummy_weight_loader,
     monkey_patch_vllm_p2p_access_check,
 )
@@ -78,21 +87,55 @@ class ModelRunner:
         # Parse args
         self.model_config = model_config
         self.mem_fraction_static = mem_fraction_static
+        self.device = server_args.device
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
-        self.nccl_port = nccl_port
+        self.dist_port = nccl_port
         self.server_args = server_args
         self.is_multimodal_model = is_multimodal_model(
             self.model_config.hf_config.architectures
         )
 
+        # Model-specific adjustment
         if (
             self.model_config.attention_arch == AttentionArch.MLA
             and not self.server_args.disable_mla
         ):
-            logger.info("MLA optimization is tunred on. Use triton backend.")
+            logger.info("MLA optimization is turned on. Use triton backend.")
             self.server_args.attention_backend = "triton"
+
+        if self.server_args.enable_double_sparsity:
+            logger.info(
+                "Double sparsity optimization is turned on. Use triton backend without CUDA graph."
+            )
+            self.server_args.attention_backend = "triton"
+            self.server_args.disable_cuda_graph = True
+            if self.server_args.ds_heavy_channel_type is None:
+                raise ValueError(
+                    "Please specify the heavy channel type for double sparsity optimization."
+                )
+            self.init_double_sparsity_channel_config(
+                self.server_args.ds_heavy_channel_type
+            )
+
+        if self.is_multimodal_model:
+            logger.warning(
+                "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
+            )
+            server_args.chunked_prefill_size = None
+            server_args.mem_fraction_static *= 0.95
+            # TODO: qwen2-vl does not support radix cache now, set disable_radix_cache=True automatically
+            if self.model_config.hf_config.architectures == [
+                "Qwen2VLForConditionalGeneration"
+            ]:
+                server_args.disable_radix_cache = True
+
+        # Global vars
+        if server_args.show_time_cost:
+            enable_show_time_cost()
+        if server_args.disable_disk_cache:
+            disable_cache()
 
         global_server_args_dict.update(
             {
@@ -101,16 +144,10 @@ class ModelRunner:
                 "triton_attention_reduce_in_fp32": server_args.triton_attention_reduce_in_fp32,
                 "disable_mla": server_args.disable_mla,
                 "torchao_config": server_args.torchao_config,
+                "disable_penalizer": server_args.disable_penalizer,
+                "disable_nan_detection": server_args.disable_nan_detection,
             }
         )
-
-        # Model-specific adjustment
-        if self.is_multimodal_model:
-            logger.info(
-                "Automatically turn off --chunked-prefill-size and adjust --mem-fraction-static for multimodal models."
-            )
-            server_args.chunked_prefill_size = None
-            server_args.mem_fraction_static *= 0.95
 
         # Init componnets
         min_per_gpu_memory = self.init_torch_distributed()
@@ -123,39 +160,51 @@ class ModelRunner:
             server_args.max_running_requests,
             server_args.max_total_tokens,
         )
-        self.init_cublas()
-        self.init_attention_backend()
-        self.init_cuda_graphs()
+        if self.device == "cuda":
+            self.init_cublas()
+            self.init_attention_backend()
+            self.init_cuda_graphs()
+        else:
+            self.cuda_graph_runner = None
+            self.init_attention_backend()
 
     def init_torch_distributed(self):
+        logger.info("Init torch distributed begin.")
         # Init torch distributed
-        torch.cuda.set_device(self.gpu_id)
-        logger.info("Init nccl begin.")
+        if self.device == "cuda":
+            torch.cuda.set_device(self.gpu_id)
+            backend = "nccl"
+        # ToDO(liangan1):Just use gloo to bypass the initilization fail
+        # Need to use xccl for xpu backend in the future
+        elif self.device == "xpu":
+            torch.xpu.set_device(self.gpu_id)
+            backend = "gloo"
 
         if not self.server_args.enable_p2p_check:
             monkey_patch_vllm_p2p_access_check(self.gpu_id)
-
-        if self.server_args.nccl_init_addr:
-            nccl_init_method = f"tcp://{self.server_args.nccl_init_addr}"
+        if self.server_args.dist_init_addr:
+            dist_init_method = f"tcp://{self.server_args.dist_init_addr}"
         else:
-            nccl_init_method = f"tcp://127.0.0.1:{self.nccl_port}"
+            dist_init_method = f"tcp://127.0.0.1:{self.dist_port}"
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
         init_distributed_environment(
-            backend="nccl",
+            backend=backend,
             world_size=self.tp_size,
             rank=self.tp_rank,
             local_rank=self.gpu_id,
-            distributed_init_method=nccl_init_method,
+            distributed_init_method=dist_init_method,
         )
         initialize_model_parallel(tensor_model_parallel_size=self.tp_size)
         min_per_gpu_memory = get_available_gpu_memory(
-            self.gpu_id, distributed=self.tp_size > 1
+            self.device, self.gpu_id, distributed=self.tp_size > 1
         )
         self.tp_group = get_tp_group()
 
         # Currently, there is a bug with mulit-node tensor parallelsim + padded cuda graph,
         # so we disable padding in cuda graph.
-        if not all(in_the_same_node_as(self.tp_group.cpu_group, source_rank=0)):
+        if self.device == "cuda" and not all(
+            in_the_same_node_as(self.tp_group.cpu_group, source_rank=0)
+        ):
             self.server_args.disable_cuda_graph_padding = True
             logger.info(
                 "Setting disable_cuda_graph_padding to True because of multi-node tensor parallelism."
@@ -163,7 +212,7 @@ class ModelRunner:
 
         # Check memory for tensor parallelism
         if self.tp_size > 1:
-            local_gpu_memory = get_available_gpu_memory(self.gpu_id)
+            local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 raise ValueError(
                     "The memory capacity is unbalanced. Some GPUs may be occupied by other processes."
@@ -173,23 +222,22 @@ class ModelRunner:
 
     def load_model(self):
         logger.info(
-            f"Load weight begin. avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+            f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
         # This can reduce thread conflicts and speed up weight loading.
         torch.set_num_threads(1)
-
-        if torch.cuda.get_device_capability()[0] < 8:
-            logger.info(
-                "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
-            )
-            self.server_args.dtype = "float16"
-            if torch.cuda.get_device_capability()[1] < 5:
-                raise RuntimeError("SGLang only supports sm75 and above.")
+        if self.device == "cuda":
+            if torch.cuda.get_device_capability()[0] < 8:
+                logger.info(
+                    "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
+                )
+                self.server_args.dtype = "float16"
+                if torch.cuda.get_device_capability()[1] < 5:
+                    raise RuntimeError("SGLang only supports sm75 and above.")
 
         # Prepare the vllm model config
         monkey_patch_vllm_dummy_weight_loader()
-        self.device_config = DeviceConfig()
         self.load_config = LoadConfig(load_format=self.server_args.load_format)
         self.vllm_model_config = VllmModelConfig(
             model=self.server_args.model_path,
@@ -211,7 +259,7 @@ class ModelRunner:
         self.model = get_model(
             model_config=self.vllm_model_config,
             load_config=self.load_config,
-            device_config=self.device_config,
+            device_config=DeviceConfig(self.device),
             parallel_config=None,
             scheduler_config=None,
             lora_config=None,
@@ -230,7 +278,7 @@ class ModelRunner:
             f"Load weight end. "
             f"type={type(self.model).__name__}, "
             f"dtype={self.dtype}, "
-            f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
     def update_weights(self, model_path: str, load_format: str):
@@ -244,10 +292,10 @@ class ModelRunner:
 
         logger.info(
             f"Update weights begin. "
-            f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
-        target_device = torch.device(self.device_config.device)
+        target_device = torch.device(self.device)
 
         try:
             # TODO: Use a better method to check this
@@ -275,11 +323,13 @@ class ModelRunner:
 
         def get_weight_iter(config):
             iter = loader._get_weights_iterator(
-                config.model,
-                config.revision,
-                fall_back_to_pt=getattr(
-                    self.model, "fall_back_to_pt_during_load", True
-                ),
+                DefaultModelLoader.Source(
+                    config.model,
+                    revision=config.revision,
+                    fall_back_to_pt=getattr(
+                        self.model, "fall_back_to_pt_during_load", True
+                    ),
+                )
             )
             return iter
 
@@ -333,7 +383,7 @@ class ModelRunner:
 
     def profile_max_num_token(self, total_gpu_memory: int):
         available_gpu_memory = get_available_gpu_memory(
-            self.gpu_id, distributed=self.tp_size > 1
+            self.device, self.gpu_id, distributed=self.tp_size > 1
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
@@ -400,8 +450,10 @@ class ModelRunner:
             )
 
         self.req_to_token_pool = ReqToTokenPool(
-            max_num_reqs + 1,
-            self.model_config.context_len + 4,
+            size=max_num_reqs + 1,
+            max_context_len=self.model_config.context_len + 4,
+            device=self.device,
+            use_records=False,
         )
         if (
             self.model_config.attention_arch == AttentionArch.MLA
@@ -413,6 +465,17 @@ class ModelRunner:
                 kv_lora_rank=self.model_config.kv_lora_rank,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 layer_num=self.model_config.num_hidden_layers,
+                device=self.device,
+            )
+        elif self.server_args.enable_double_sparsity:
+            self.token_to_kv_pool = DoubleSparseTokenToKVPool(
+                self.max_total_num_tokens,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(self.tp_size),
+                head_dim=self.model_config.head_dim,
+                layer_num=self.model_config.num_hidden_layers,
+                device=self.device,
+                heavy_channel_num=self.server_args.ds_heavy_channel_num,
             )
         else:
             self.token_to_kv_pool = MHATokenToKVPool(
@@ -421,10 +484,11 @@ class ModelRunner:
                 head_num=self.model_config.get_num_kv_heads(self.tp_size),
                 head_dim=self.model_config.head_dim,
                 layer_num=self.model_config.num_hidden_layers,
+                device=self.device,
             )
         logger.info(
             f"Memory pool end. "
-            f"avail mem={get_available_gpu_memory(self.gpu_id):.2f} GB"
+            f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
 
     def init_cublas(self):
@@ -445,10 +509,35 @@ class ModelRunner:
                 "Window attention is not supported in the triton attention backend. "
                 "Please use `--attention-backend flashinfer`."
             )
-            self.attn_backend = TritonAttnBackend(self)
+            assert not self.model_config.is_encoder_decoder, (
+                "Cross attention is not supported in the triton attention backend. "
+                "Please use `--attention-backend flashinfer`."
+            )
+            if self.server_args.enable_double_sparsity:
+                self.attn_backend = DoubleSparseAttnBackend(self)
+            else:
+                self.attn_backend = TritonAttnBackend(self)
         else:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
+            )
+
+    def init_double_sparsity_channel_config(self, selected_channel):
+
+        selected_channel = "." + selected_channel + "_proj"
+        self.sorted_channels = []
+        # load channel config
+        with open(self.server_args.ds_channel_config_path, "r") as f:
+            channel_config = json.load(f)
+
+        for i in range(self.model_config.num_hidden_layers):
+            key = "model.layers." + str(i) + ".self_attn" + selected_channel
+            self.sorted_channels.append(
+                torch.tensor(channel_config[key])[
+                    :, : self.server_args.ds_heavy_channel_num
+                ]
+                .contiguous()
+                .cuda()
             )
 
     def init_cuda_graphs(self):
@@ -467,70 +556,60 @@ class ModelRunner:
         logger.info("Capture cuda graph begin. This can take up to several minutes.")
         self.cuda_graph_runner = CudaGraphRunner(self)
 
-    def forward_decode(self, batch: ScheduleBatch):
-        if self.server_args.lora_paths is not None:
-            self.lora_manager.prepare_lora_batch(batch)
+    def forward_decode(self, forward_batch: ForwardBatch):
+        if self.cuda_graph_runner and self.cuda_graph_runner.can_run(forward_batch):
+            return self.cuda_graph_runner.replay(forward_batch)
 
-        if self.cuda_graph_runner and self.cuda_graph_runner.can_run(len(batch.reqs)):
-            return self.cuda_graph_runner.replay(batch)
-
-        input_metadata = InputMetadata.from_schedule_batch(self, batch)
-
+        forward_batch.positions = (forward_batch.seq_lens - 1).to(torch.int64)
+        self.attn_backend.init_forward_metadata(forward_batch)
         return self.model.forward(
-            batch.input_ids, input_metadata.positions, input_metadata
+            forward_batch.input_ids, forward_batch.positions, forward_batch
         )
 
-    def forward_extend(self, batch: ScheduleBatch):
-        input_metadata = InputMetadata.from_schedule_batch(self, batch)
-        if self.server_args.lora_paths is not None:
-            self.lora_manager.prepare_lora_batch(batch, input_metadata.extend_seq_lens)
-
+    def forward_extend(self, forward_batch: ForwardBatch):
+        self.attn_backend.init_forward_metadata(forward_batch)
         if self.is_generation:
             return self.model.forward(
-                batch.input_ids, input_metadata.positions, input_metadata
+                forward_batch.input_ids, forward_batch.positions, forward_batch
             )
         else:
             # Only embedding models have get_embedding parameter
             return self.model.forward(
-                batch.input_ids,
-                input_metadata.positions,
-                input_metadata,
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
                 get_embedding=True,
             )
 
-    def forward_extend_multi_modal(self, batch: ScheduleBatch):
-        input_metadata = InputMetadata.from_schedule_batch(self, batch)
-        return self.model.forward(
-            batch.input_ids,
-            input_metadata.positions,
-            input_metadata,
-            input_metadata.pixel_values,
-            input_metadata.image_sizes,
-            input_metadata.image_offsets,
-        )
-
-    def forward(self, batch: ScheduleBatch) -> Tuple[LogitsProcessorOutput]:
-        assert batch.forward_mode is not None
-
-        if self.is_multimodal_model and batch.forward_mode.is_extend():
-            return self.forward_extend_multi_modal(batch)
-        elif batch.forward_mode.is_decode():
-            return self.forward_decode(batch)
-        elif batch.forward_mode.is_extend():
-            return self.forward_extend(batch)
+    def forward(self, forward_batch: ForwardBatch) -> LogitsProcessorOutput:
+        if forward_batch.forward_mode.is_decode():
+            return self.forward_decode(forward_batch)
+        elif forward_batch.forward_mode.is_extend():
+            return self.forward_extend(forward_batch)
         else:
-            raise ValueError(f"Invaid forward mode: {batch.forward_mode}")
+            raise ValueError(f"Invaid forward mode: {forward_batch.forward_mode}")
 
-    def _apply_logits_bias(
-        self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
-    ):
+    def sample(
+        self, logits_output: LogitsProcessorOutput, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        # Put CPU-heavy tasks here. They will be overlapped with the forward pass.
+        sampling_info = forward_batch.sampling_info
+        sampling_info.update_regex_vocab_mask()
+        sampling_info.update_penalties()
+        logits = self.apply_logits_bias(logits_output.next_token_logits, sampling_info)
+
+        # Sample the next tokens.
+        next_token_ids = self.sampler(logits, sampling_info)
+        return next_token_ids
+
+    def apply_logits_bias(self, logits: torch.Tensor, sampling_info: SamplingBatchInfo):
         # Apply logit_bias
         if sampling_info.logit_bias is not None:
             logits.add_(sampling_info.logit_bias)
 
         # min-token, presence, frequency
         if sampling_info.linear_penalties is not None:
-            logits += sampling_info.linear_penalties
+            logits.add_(sampling_info.linear_penalties)
 
         # repetition
         if sampling_info.scaling_penalties is not None:
@@ -546,19 +625,14 @@ class ModelRunner:
 
         return logits
 
-    def sample(
-        self, logits_output: LogitsProcessorOutput, batch: ScheduleBatch
-    ) -> torch.Tensor:
-        # Put CPU-heavy tasks here. They will be overlapped with the forward pass.
-        batch.sampling_info.update_regex_vocab_mask(batch)
-        batch.sampling_info.update_penalties()
-        logits = self._apply_logits_bias(
-            logits_output.next_token_logits, batch.sampling_info
-        )
-
-        # Sample the next tokens.
-        next_token_ids = self.sampler(logits, batch.sampling_info)
-        return next_token_ids
+    @property
+    def model_is_mrope(self) -> bool:
+        """Detect if the model has "mrope" rope_scaling type.
+        mrope requires keep "rope_deltas" between prompt and decoding phases."""
+        rope_scaling = getattr(self.model_config.hf_config, "rope_scaling", {})
+        if rope_scaling is None:
+            return False
+        return rope_scaling.get("type", None) == "mrope"
 
 
 @lru_cache()
@@ -568,17 +642,25 @@ def import_model_classes():
     package = importlib.import_module(package_name)
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
-            module = importlib.import_module(name)
+            try:
+                module = importlib.import_module(name)
+            except Exception as e:
+                logger.warning(f"Ignore import error when loading {name}. " f"{e}")
+                continue
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass
                 if isinstance(
                     entry, list
                 ):  # To support multiple model classes in one module
                     for tmp in entry:
-                        assert tmp.__name__ not in model_arch_name_to_cls
+                        assert (
+                            tmp.__name__ not in model_arch_name_to_cls
+                        ), f"Duplicated model implementation for {tmp.__name__}"
                         model_arch_name_to_cls[tmp.__name__] = tmp
                 else:
-                    assert entry.__name__ not in model_arch_name_to_cls
+                    assert (
+                        entry.__name__ not in model_arch_name_to_cls
+                    ), f"Duplicated model implementation for {entry.__name__}"
                     model_arch_name_to_cls[entry.__name__] = entry
 
     return model_arch_name_to_cls
@@ -597,3 +679,7 @@ def load_model_cls_srt(model_arch: str) -> Optional[Type[nn.Module]]:
 
 # Monkey patch model loader
 setattr(ModelRegistry, "_try_load_model_cls", load_model_cls_srt)
+setattr(ModelRegistry, "is_multimodal_model", is_multimodal_model)
+setattr(ModelRegistry, "is_attention_free_model", is_attention_free_model)
+setattr(ModelRegistry, "model_has_inner_state", model_has_inner_state)
+setattr(ModelRegistry, "is_embedding_model", is_embedding_model)

@@ -13,12 +13,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import logging
+import os
 from enum import IntEnum, auto
 from typing import Optional
 
 from transformers import PretrainedConfig
 
 from sglang.srt.hf_transformers_utils import get_config, get_context_length
+
+logger = logging.getLogger(__name__)
 
 
 class AttentionArch(IntEnum):
@@ -46,16 +50,35 @@ class ModelConfig:
             model_override_args=model_override_args,
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
-        if context_length is not None:
-            self.context_len = context_length
-        else:
-            self.context_len = get_context_length(self.hf_config)
+        derived_context_len = get_context_length(self.hf_text_config)
+        allow_long_context = os.environ.get(
+            "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", None
+        )
 
-        # Unify the config keys for hf_config
+        if context_length is not None:
+            if context_length > derived_context_len:
+                if allow_long_context:
+                    logger.warning(
+                        f"Warning: User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
+                        f"This may lead to incorrect model outputs or CUDA errors."
+                    )
+                    self.context_len = context_length
+                else:
+                    raise ValueError(
+                        f"User-specified context_length ({context_length}) is greater than the derived context_length ({derived_context_len}). "
+                        f"This may lead to incorrect model outputs or CUDA errors. Note that the derived context_length may differ from max_position_embeddings in the model's config. "
+                        f"To allow overriding this maximum, set the env var SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1"
+                    )
+            else:
+                self.context_len = context_length
+        else:
+            self.context_len = derived_context_len
+
+        # Unify the config keys for hf_text_config
         self.head_dim = getattr(
-            self.hf_config,
+            self.hf_text_config,
             "head_dim",
-            self.hf_config.hidden_size // self.hf_config.num_attention_heads,
+            self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
         )
 
         # FIXME: temporary special judge for deepseek v2 MLA architecture
@@ -72,8 +95,10 @@ class ModelConfig:
         else:
             self.attention_arch = AttentionArch.MHA
 
-        self.num_attention_heads = self.hf_config.num_attention_heads
-        self.num_key_value_heads = getattr(self.hf_config, "num_key_value_heads", None)
+        self.num_attention_heads = self.hf_text_config.num_attention_heads
+        self.num_key_value_heads = getattr(
+            self.hf_text_config, "num_key_value_heads", None
+        )
 
         # for Dbrx and MPT models
         if self.hf_config.model_type in ["dbrx", "mpt"]:
@@ -83,9 +108,11 @@ class ModelConfig:
 
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
-        self.hidden_size = self.hf_config.hidden_size
-        self.num_hidden_layers = self.hf_config.num_hidden_layers
-        self.vocab_size = self.hf_config.vocab_size
+        self.hidden_size = self.hf_text_config.hidden_size
+        self.num_hidden_layers = self.hf_text_config.num_hidden_layers
+        self.vocab_size = self.hf_text_config.vocab_size
+
+        self.is_encoder_decoder = self.hf_config.model_type in ["mllama"]
 
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:

@@ -40,24 +40,32 @@ class ModelCase:
     prefill_tolerance: float = 5e-2
     decode_tolerance: float = 5e-2
     rouge_l_tolerance: float = 1
+    skip_long_prompt: bool = False
 
 
-# Popular models that run on CI
+# Popular models that run on the CI
 CI_MODELS = [
-    ModelCase("meta-llama/Meta-Llama-3.1-8B-Instruct"),
+    ModelCase("meta-llama/Llama-3.1-8B-Instruct"),
     ModelCase("google/gemma-2-2b"),
 ]
 
-# All other models
+# All other models that do not run on the CI
 ALL_OTHER_MODELS = [
     ModelCase("Qwen/Qwen2-1.5B"),
-    ModelCase("HuggingFaceTB/SmolLM-135M-Instruct"),
+    ModelCase("Qwen/Qwen2.5-14B-Instruct"),
+    ModelCase("HuggingFaceTB/SmolLM-135M-Instruct", skip_long_prompt=True),
+    ModelCase("allenai/OLMo-1B-0724-hf", decode_tolerance=8e-2, skip_long_prompt=True),
+    ModelCase("THUDM/glm-4-9b-chat"),
 ]
 
 TORCH_DTYPES = [torch.float16]
 
 
 class TestGenerationModels(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        mp.set_start_method("spawn")
+
     def assert_close_logits_and_output_strs(
         self,
         prompts: List[str],
@@ -73,7 +81,9 @@ class TestGenerationModels(unittest.TestCase):
         max_new_tokens = 32
 
         with HFRunner(
-            model_path, torch_dtype=torch_dtype, is_generation=True
+            model_path,
+            torch_dtype=torch_dtype,
+            model_type="generation",
         ) as hf_runner:
             hf_outputs = hf_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
@@ -81,7 +91,7 @@ class TestGenerationModels(unittest.TestCase):
             model_path,
             tp_size=model_case.tp_size,
             torch_dtype=torch_dtype,
-            is_generation=True,
+            model_type="generation",
         ) as srt_runner:
             srt_outputs = srt_runner.forward(prompts, max_new_tokens=max_new_tokens)
 
@@ -128,8 +138,15 @@ class TestGenerationModels(unittest.TestCase):
     def test_ci_models(self):
         for model_case in CI_MODELS:
             for torch_dtype in TORCH_DTYPES:
+
+                # Skip long prompts for models that do not have a long context
+                prompts = DEFAULT_PROMPTS
+                if model_case.skip_long_prompt:
+                    prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
+
+                # Assert the logits and output strs are close
                 self.assert_close_logits_and_output_strs(
-                    DEFAULT_PROMPTS, model_case, torch_dtype
+                    prompts, model_case, torch_dtype
                 )
 
     def test_others(self):
@@ -137,16 +154,21 @@ class TestGenerationModels(unittest.TestCase):
             return
 
         for model_case in ALL_OTHER_MODELS:
+            # Only run a specified model
             if (
                 "ONLY_RUN" in os.environ
                 and os.environ["ONLY_RUN"] != model_case.model_path
             ):
                 continue
-            self.assert_close_logits_and_output_strs(
-                DEFAULT_PROMPTS, model_case, torch.float16
-            )
+
+            # Skip long prompts for models that do not have a long context
+            prompts = DEFAULT_PROMPTS
+            if model_case.skip_long_prompt:
+                prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
+
+            # Assert the logits and output strs are close
+            self.assert_close_logits_and_output_strs(prompts, model_case, torch.float16)
 
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn")
     unittest.main()
