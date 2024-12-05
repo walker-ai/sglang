@@ -1,32 +1,38 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 """A tensor parallel worker."""
 
 import dataclasses
 import logging
+import signal
 import threading
 from queue import Queue
 from typing import Optional
 
+import psutil
 import torch
 
-from sglang.srt.managers.io_struct import UpdateWeightReqInput
+from sglang.srt.managers.io_struct import (
+    GetWeightsByNameReqInput,
+    InitWeightsUpdateGroupReqInput,
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDistributedReqInput,
+)
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
+from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +78,7 @@ class TpModelWorkerClient:
             target=self.forward_thread_func,
         )
         self.forward_thread.start()
+        self.parent_process = psutil.Process().parent()
 
     def get_worker_info(self):
         return self.worker.get_worker_info()
@@ -89,8 +96,13 @@ class TpModelWorkerClient:
         )
 
     def forward_thread_func(self):
-        with torch.cuda.stream(self.forward_stream):
-            self.forward_thread_func_()
+        try:
+            with torch.cuda.stream(self.forward_stream):
+                self.forward_thread_func_()
+        except Exception:
+            traceback = get_exception_traceback()
+            logger.error(f"TpModelWorkerClient hit an exception: {traceback}")
+            self.parent_process.send_signal(signal.SIGQUIT)
 
     @torch.no_grad()
     def forward_thread_func_(self):
@@ -197,9 +209,22 @@ class TpModelWorkerClient:
         ) % self.future_token_ids_limit
         return None, future_next_token_ids
 
-    def update_weights(self, recv_req: UpdateWeightReqInput):
-        success, message = self.worker.update_weights(recv_req)
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        success, message = self.worker.update_weights_from_disk(recv_req)
         return success, message
+
+    def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
+        success, message = self.worker.init_weights_update_group(recv_req)
+        return success, message
+
+    def update_weights_from_distributed(
+        self, recv_req: UpdateWeightsFromDistributedReqInput
+    ):
+        success, message = self.worker.update_weights_from_distributed(recv_req)
+        return success, message
+
+    def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
+        return self.worker.get_weights_by_name(recv_req)
 
     def __delete__(self):
         self.input_queue.put((None, None))

@@ -1,31 +1,30 @@
-"""
-Copyright 2023-2024 SGLang Team
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright 2023-2024 SGLang Team
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
 
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/mixtral.py#L1
 """Inference-only Mixtral model."""
+
 from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import MixtralConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
+from sglang.srt.layers.fused_moe_triton import FusedMoE
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -35,13 +34,12 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.torchao_utils import apply_torchao_config_
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 
 
 class MixtralMoE(nn.Module):
@@ -291,12 +289,10 @@ class MixtralForCausalLM(nn.Module):
         self,
         config: MixtralConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.torchao_config = global_server_args_dict["torchao_config"]
         self.model = MixtralModel(config, quant_config=quant_config, prefix="model")
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         self.logits_processor = LogitsProcessor(config)
@@ -310,7 +306,7 @@ class MixtralForCausalLM(nn.Module):
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -340,7 +336,9 @@ class MixtralForCausalLM(nn.Module):
                     continue
                 name = name.replace(weight_name, param_name)
                 # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
+                if (
+                    name.endswith(".bias") or name.endswith("_bias")
+                ) and name not in params_dict:
                     continue
 
                 param = params_dict[name]
@@ -354,6 +352,10 @@ class MixtralForCausalLM(nn.Module):
                         continue
                     name = name.replace(weight_name, param_name)
 
+                    if (
+                        name.endswith(".bias") or name.endswith("_bias")
+                    ) and name not in params_dict:
+                        continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(
@@ -366,7 +368,9 @@ class MixtralForCausalLM(nn.Module):
                     break
                 else:
                     # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
+                    if (
+                        name.endswith(".bias") or name.endswith("_bias")
+                    ) and name not in params_dict:
                         continue
                     # Skip loading kv_scale from ckpts towards new design.
                     if name.endswith(".kv_scale") and name not in params_dict:
@@ -379,8 +383,6 @@ class MixtralForCausalLM(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
-
-        apply_torchao_config_(self, params_dict, set(["proj.weight"]))
 
 
 EntryClass = MixtralForCausalLM

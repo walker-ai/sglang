@@ -28,7 +28,6 @@ import torch
 from torch import nn
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from sglang.srt.configs.glm import GLMConfig
 from sglang.srt.layers.activation import SiluAndMul
@@ -46,23 +45,25 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import make_layers
 
 LoraConfig = None
 
 
 class GLMMLP_V2(nn.Module):
     def __init__(
-            self,
-            intermediate_size: int,
-            config: GLMConfig,
-            quant_config: Optional[QuantizationConfig] = None,
+        self,
+        intermediate_size: int,
+        config: GLMConfig,
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size, [intermediate_size] * 2,
             bias=config.use_bias,
             quant_config=quant_config,
-                                )
+        )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             config.hidden_size,
@@ -83,10 +84,10 @@ class GLMMLP_V2(nn.Module):
 
 class GLMAttention(nn.Module):
     def __init__(
-            self,
-            config: GLMConfig,
-            layer_id: int = 0,
-            quant_config: Optional[QuantizationConfig] = None,
+        self,
+        config: GLMConfig,
+        layer_id: int = 0,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         # hidden_states大小
@@ -133,7 +134,7 @@ class GLMAttention(nn.Module):
             self.hidden_size,
             bias=config.use_bias,
             quant_config=quant_config,
-            )
+        )
 
         if not self.use_rotary or self.rotary_type != 'full-1d':
             raise ValueError("Unsupported model arch. Only full-1d rope is supported for now.")
@@ -155,10 +156,10 @@ class GLMAttention(nn.Module):
         )
 
     def forward(
-            self,
-            positions: torch.Tensor,
-            hidden_states: torch.Tensor,
-            forward_batch: ForwardBatch,
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         qkv, _ = self.query_key_value(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -170,10 +171,10 @@ class GLMAttention(nn.Module):
 
 class GLMBlock(nn.Module):
     def __init__(
-            self,
-            config: GLMConfig,
-            layer_id: int = 0,
-            quant_config: Optional[QuantizationConfig] = None,
+        self,
+        config: GLMConfig,
+        layer_id: int = 0,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         hidden_size = config.hidden_size
@@ -198,11 +199,11 @@ class GLMBlock(nn.Module):
         self.mlp = mlp_class(intermediate_size, config, quant_config)
 
     def forward(
-            self,
-            positions: torch.Tensor,
-            hidden_states: torch.Tensor,
-            forward_batch: ForwardBatch,
-            residual: Optional[torch.Tensor],
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
         if residual is None:
@@ -226,19 +227,23 @@ class GLMBlock(nn.Module):
 class GLMModel(nn.Module):
 
     def __init__(
-            self,
-            config: GLMConfig,
-            quant_config: Optional[QuantizationConfig] = None,
+        self,
+        config: GLMConfig,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.config = config
         self.vocab_size = config.vocab_size
         self.embed_dim = config.hidden_size
-        self.word_embeddings = VocabParallelEmbedding(self.vocab_size, self.embed_dim)
+        self.word_embeddings = VocabParallelEmbedding(
+            self.vocab_size,
+            self.embed_dim,
+            quant_config=quant_config,
+        )
 
         # tie_word_embeddings为true，复用tie_word_embeddings，反之是独立的
         self.lm_head = self.word_embeddings if config.tie_word_embeddings \
-            else ParallelLMHead(self.vocab_size, self.embed_dim)
+            else ParallelLMHead(self.vocab_size, self.embed_dim, quant_config=quant_config)
 
         self.embedding_dropout = torch.nn.Dropout(config.embedding_dropout_prob)
 
@@ -248,15 +253,23 @@ class GLMModel(nn.Module):
                 for i in range(config.num_hidden_layers)
             ]
         )
+        self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: GLMBlock(
+                layer_id=idx,
+                config=config,
+                quant_config=quant_config,
+            ),
+        )
 
         self.final_layernorm = RMSNorm(self.embed_dim, eps=1.0e-5) if config.use_rmsnorm \
             else nn.LayerNorm(self.embed_dim, eps=1.0e-5)
 
     def forward(
-            self,
-            input_ids: torch.Tensor,
-            positions: torch.Tensor,
-            forward_batch: ForwardBatch,
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         hidden_states = self.word_embeddings(input_ids)
         # hidden_states = self.embedding_dropout(hidden_states)
@@ -276,10 +289,9 @@ class GLMModel(nn.Module):
 
 class GLMForCausalLM(nn.Module):
     def __init__(
-            self,
-            config: GLMConfig,
-            quant_config: Optional[QuantizationConfig] = None,
-            cache_config=None,
+        self,
+        config: GLMConfig,
+        quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.config = config
@@ -290,17 +302,16 @@ class GLMForCausalLM(nn.Module):
 
     @torch.no_grad()
     def forward(
-            self,
-            input_ids: torch.Tensor,
-            positions: torch.Tensor,
-            forward_batch: ForwardBatch,
-            input_embeds: torch.Tensor = None,
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
         hidden_states = self.transformer(input_ids, positions, forward_batch)
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head.weight, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch
         )
-
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -312,7 +323,7 @@ class GLMForCausalLM(nn.Module):
         for name, loaded_weight in weights:
             # lm_head 在tie_word_embeddings=true时跳过，与embeddings共享；反之则独立加载
             if (("v_head" in name) or ("inv_freq" in name) or
-                    (self.config.tie_word_embeddings and "lm_head" in name)):
+                (self.config.tie_word_embeddings and "lm_head" in name)):
                 continue
 
             # 如果是norm head的方式，需要在初始化的时候对lm_head进行处理
@@ -361,6 +372,7 @@ class GLMForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
 
+
 # class GLMForConditionalGeneration(GLMForCausalLM):
 #     pass
 
@@ -370,4 +382,3 @@ class GLMForCausalLM(nn.Module):
 # EntryClass = [GLMForCausalLM, GLMForConditionalGeneration, GLMModel]
 
 EntryClass = [GLMForCausalLM]
-
