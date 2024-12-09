@@ -114,7 +114,7 @@ class ModelRunner:
             server_args.chunked_prefill_size = -1
             self.mem_fraction_static *= 0.95
             logger.info(
-                f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static} "
+                f"Automatically reduce --mem-fraction-static to {self.mem_fraction_static:.3f} "
                 f"and turn off chunked prefill "
                 f"because this is a multimodal model."
             )
@@ -141,6 +141,7 @@ class ModelRunner:
                 "torchao_config": server_args.torchao_config,
                 "enable_nan_detection": server_args.enable_nan_detection,
                 "enable_dp_attention": server_args.enable_dp_attention,
+                "enable_ep_moe": server_args.enable_ep_moe,
             }
         )
 
