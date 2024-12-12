@@ -11,17 +11,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-# rebase placeholder
+
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/c7f2cf2b7f67bce5842fedfdba508440fe257375/vllm/model_executor/models/llama.py#L1
-"""Inference-only LLaMA model compatible with HuggingFace weights."""
+"""Inference-only Granite model compatible with HuggingFace weights."""
 
 import logging
 from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-from transformers import LlamaConfig
+from transformers import GraniteConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
@@ -42,13 +42,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import make_layers
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
 
-class LlamaMLP(nn.Module):
+class GraniteMLP(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -86,10 +85,10 @@ class LlamaMLP(nn.Module):
         return x
 
 
-class LlamaAttention(nn.Module):
+class GraniteAttention(nn.Module):
     def __init__(
         self,
-        config: LlamaConfig,
+        config: GraniteConfig,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -123,7 +122,7 @@ class LlamaAttention(nn.Module):
         )
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
+        self.scaling = config.attention_multiplier
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
@@ -174,16 +173,17 @@ class LlamaAttention(nn.Module):
         return output
 
 
-class LlamaDecoderLayer(nn.Module):
+class GraniteDecoderLayer(nn.Module):
     def __init__(
         self,
-        config: LlamaConfig,
+        config: GraniteConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.residual_multiplier = config.residual_multiplier
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
         if rope_scaling is not None and getattr(
@@ -194,7 +194,7 @@ class LlamaDecoderLayer(nn.Module):
             )
         rope_is_neox_style = getattr(config, "rope_is_neox_style", True)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.self_attn = LlamaAttention(
+        self.self_attn = GraniteAttention(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -207,7 +207,7 @@ class LlamaDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
-        self.mlp = LlamaMLP(
+        self.mlp = GraniteMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -232,22 +232,25 @@ class LlamaDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
+        hidden_states = (
+            self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            * self.residual_multiplier
+        )  # multiplier for Maximal Update Parameterization
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states) * self.residual_multiplier
         return hidden_states, residual
 
 
-class LlamaModel(nn.Module):
+class GraniteModel(nn.Module):
     def __init__(
         self,
-        config: LlamaConfig,
+        config: GraniteConfig,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
@@ -255,18 +258,16 @@ class LlamaModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
+            config.vocab_size, config.hidden_size
         )
-        self.layers = make_layers(
-            config.num_hidden_layers,
-            lambda idx, prefix: LlamaDecoderLayer(
-                config=config, quant_config=quant_config, layer_id=idx, prefix=prefix
-            ),
-            prefix="model.layers",
+        self.layers = nn.ModuleList(
+            [
+                GraniteDecoderLayer(
+                    config, i, quant_config=quant_config, prefix=f"model.layers.{i}"
+                )
+                for i in range(config.num_hidden_layers)
+            ]
         )
-
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -281,6 +282,7 @@ class LlamaModel(nn.Module):
         else:
             hidden_states = input_embeds
         residual = None
+        hidden_states *= self.config.embedding_multiplier
         for i in range(len(self.layers)):
             layer = self.layers[i]
             hidden_states, residual = layer(
@@ -293,47 +295,33 @@ class LlamaModel(nn.Module):
         return hidden_states
 
 
-class LlamaForCausalLM(nn.Module):
-
-    # BitandBytes specific attributes
-    default_bitsandbytes_target_modules = [
-        ".gate_proj.",
-        ".down_proj.",
-        ".up_proj.",
-        ".q_proj.",
-        ".k_proj.",
-        ".v_proj.",
-        ".o_proj.",
-    ]
-    # in TP, these weights are partitioned along the column dimension (dim=-1)
-    column_parallel_weights_modules = [".down_proj.", ".o_proj."]
-    bitsandbytes_stacked_params_mapping = {
-        # shard_name, weight_name, index
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
-
+class GraniteForCausalLM(nn.Module):
     def __init__(
         self,
-        config: LlamaConfig,
+        config: GraniteConfig,
         quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = LlamaModel(config, quant_config=quant_config)
-        # Llama 3.2 1B Insturct set tie_word_embeddings to True
-        # Llama 3.1 8B Insturct set tie_word_embeddings to False
+        self.model = GraniteModel(config, quant_config=quant_config)
+        # If tie_word_embeddings == True, then input and output embeddings are
+        # the same tensor. Enforce during object creation so that weights will
+        # load correctly even if the LM head weights don't have a separate entry
+        # in the state dict.
+        self.lm_head = ParallelLMHead(
+            config.vocab_size, config.hidden_size, quant_config=quant_config
+        )
         if self.config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
+            self.lm_head.tie_weights(self.model.embed_tokens)
+
+        # Granite logit scaling factors are applied via division, but
+        # LogitsProcessor expects a multiplicative factor.
+        if hasattr(config, "logits_scaling"):
+            logit_scale = 1.0 / config.logits_scaling
         else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config
-            )
-        self.logits_processor = LogitsProcessor(config)
+            logit_scale = None
+        self.logits_processor = LogitsProcessor(config, logit_scale=logit_scale)
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -355,9 +343,10 @@ class LlamaForCausalLM(nn.Module):
     ) -> LogitsProcessorOutput:
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         if not get_embedding:
-            return self.logits_processor(
+            logits_processor_output: LogitsProcessorOutput = self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch
             )
+            return logits_processor_output
         else:
             return self.pooler(hidden_states, forward_batch)
 
@@ -420,6 +409,11 @@ class LlamaForCausalLM(nn.Module):
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
+            if "lm_head.weight" in name and self.config.tie_word_embeddings:
+                # Input and output embeddings are tied, so the output embeddings
+                # may not be present in the checkpoint. We assume that the input
+                # embeddings are always present in the checkpoint.
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -433,6 +427,9 @@ class LlamaForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                # This block only runs if the preceding for loop doesn't find
+                # a match for `name` in `stacked_params_mapping`.
+
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -512,13 +509,9 @@ class LlamaForCausalLM(nn.Module):
 
         except Exception:
             logger.error(
-                f"Error getting weights by name {name} in LlamaForCausalLM: {get_exception_traceback()}"
+                f"Error getting weights by name {name} in GraniteForCausalLM: {get_exception_traceback()}"
             )
             return None
 
 
-class Phi3ForCausalLM(LlamaForCausalLM):
-    pass
-
-
-EntryClass = [LlamaForCausalLM, Phi3ForCausalLM]
+EntryClass = [GraniteForCausalLM]

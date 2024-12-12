@@ -129,6 +129,7 @@ class ImageInputs:
     image_hashes: Optional[list] = None
     image_sizes: Optional[list] = None
     image_offsets: Optional[list] = None
+    image_pad_len: Optional[list] = None
     pad_values: Optional[list] = None
     modalities: Optional[list] = None
     num_image_tokens: Optional[int] = None
@@ -181,6 +182,7 @@ class ImageInputs:
         optional_args = [
             "image_sizes",
             "image_offsets",
+            "image_pad_len",
             # "modalities", # modalities should be ["multi-images"] (one entry) even for multiple images
             "aspect_ratio_ids",
             "aspect_ratio_mask",
@@ -254,6 +256,7 @@ class Req:
 
         # Prefix info
         self.prefix_indices = []
+        # Tokens to run prefill. input_tokens - shared_prefix_tokens.
         self.extend_input_len = 0
         self.last_node = None
 
@@ -314,6 +317,7 @@ class Req:
     def init_next_round_input(self, tree_cache: Optional[BasePrefixCache] = None):
         self.fill_ids = self.origin_input_ids + self.output_ids
         if tree_cache is not None:
+            # tree cache is None if the prefix is not computed with tree cache.
             self.prefix_indices, self.last_node = tree_cache.match_prefix(
                 rid=self.rid, key=self.adjust_max_prefix_ids()
             )
@@ -484,7 +488,7 @@ bid = 0
 
 @dataclasses.dataclass
 class ScheduleBatch:
-    """Store all inforamtion of a batch on the scheduler."""
+    """Store all information of a batch on the scheduler."""
 
     # Request, memory pool, and cache
     reqs: List[Req]
