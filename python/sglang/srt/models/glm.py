@@ -26,15 +26,21 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
 from sglang.srt.configs.glm import GLMConfig
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.ep_moe.layer import EPMoE
+from sglang.srt.layers.fused_moe_triton import FusedMoE
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -57,29 +63,103 @@ class GLMMLP_V2(nn.Module):
         intermediate_size: int,
         config: GLMConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        reduce_results: Optional[bool] = True,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size, [intermediate_size] * 2,
             bias=config.use_bias,
             quant_config=quant_config,
+            prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             config.hidden_size,
             bias=config.use_bias,
+            reduce_results=reduce_results,
             quant_config=quant_config,
+            prefix=f"{prefix}.down_proj",
         )
 
         if not config.use_swiglu:
             raise ValueError("Unsupported activation. Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
-    def forward(self, x):
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(hidden_states)
+        hidden_states = self.act_fn(gate_up)
+        hidden_states, _ = self.down_proj(hidden_states)
+        return hidden_states
+
+
+class GLMMoE_V2(nn.Module):
+    def __init__(
+        self,
+        intermediate_size: int,
+        config: GLMConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        reduce_results: Optional[bool] = True,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.num_experts = config.num_experts
+        self.top_k = config.top_k
+        self.norm_expert_prob = config.norm_expert_prob
+        self.hidden_size = config.hidden_size
+        self.num_shared_experts = config.num_shared_experts
+        # Gate always runs at half / full precision for now.
+        self.gate = ReplicatedLinear(
+            self.hidden_size,
+            self.num_experts,
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.gate",
+        )
+
+        self.experts = FusedMoE(
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            hidden_size=self.hidden_size,
+            intermediate_size=config.expert_intermediate_size,
+            reduce_results=False,
+            renormalize=self.norm_expert_prob,
+            quant_config=quant_config,
+            tp_size=self.tp_size,
+            prefix=f"{prefix}.experts"
+        )
+
+        if self.num_shared_experts > 0:
+            intermediate_size = (config.expert_intermediate_size *
+                                 self.num_shared_experts)
+            self.shared_experts = GLMMLP_V2(
+                intermediate_size=intermediate_size,
+                config=config,
+                quant_config=quant_config,
+                reduce_results=False,
+                prefix=f"{prefix}.shared_experts"
+            )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        num_tokens, hidden_size = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_size)
+        if self.num_shared_experts > 0:
+            shared_output = self.shared_experts(hidden_states)
+        # router_logits: (num_tokens, n_experts)
+        router_logits, _ = self.gate(hidden_states)
+
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states, router_logits=router_logits)
+
+        if self.num_shared_experts > 0:
+            final_hidden_states = final_hidden_states + shared_output
+
+        if self.tp_size > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(
+                final_hidden_states)
+        return final_hidden_states.view(num_tokens, hidden_size)
 
 
 class GLMAttention(nn.Module):
@@ -88,6 +168,7 @@ class GLMAttention(nn.Module):
         config: GLMConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         # hidden_states大小
@@ -127,6 +208,7 @@ class GLMAttention(nn.Module):
             self.total_kv_heads,
             bias=(config.use_bias or config.use_qkv_bias),
             quant_config=quant_config,
+            prefix=f"{prefix}.query_key_value",
         )
 
         self.dense = RowParallelLinear(
@@ -134,6 +216,7 @@ class GLMAttention(nn.Module):
             self.hidden_size,
             bias=config.use_bias,
             quant_config=quant_config,
+            prefix=f"{prefix}.dense",
         )
 
         if not self.use_rotary or self.rotary_type != 'full-1d':
@@ -175,6 +258,7 @@ class GLMBlock(nn.Module):
         config: GLMConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         hidden_size = config.hidden_size
@@ -182,21 +266,25 @@ class GLMBlock(nn.Module):
         intermediate_size = config.intermediate_size if config.intermediate_size \
             else (4 * hidden_size)
 
-        self.input_layernorm = RMSNorm(hidden_size, eps=1.0e-5) if config.use_rmsnorm \
-            else nn.LayerNorm(hidden_size, eps=1.0e-5)
+        assert config.use_rmsnorm, "DO NOT support nn.LayerNorm for bailing in SGLang"
+        self.input_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
-        self.attention = GLMAttention(config, layer_id, quant_config, )
+        self.attention = GLMAttention(
+            config,
+            layer_id,
+            quant_config,
+            prefix=f"{prefix}.attention",
+        )
 
-        self.post_attention_layernorm = RMSNorm(hidden_size, eps=1.0e-5) if config.use_rmsnorm \
-            else nn.LayerNorm(hidden_size, eps=1.0e-5)
+        self.post_attention_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
         if config.moe_config and config.num_experts > 0:
-            raise ValueError("Unsupported MoE Model.")
+            mlp_class = GLMMoE_V2
         else:
             if not (config.mlp_version == "v2" or config.gate_up):
-                raise ValueError("Unsupported GLM MLP_V1 Model.")
+                raise ValueError("Unsupported GLM MLP_V1 Model for bailing.")
             mlp_class = GLMMLP_V2
-        self.mlp = mlp_class(intermediate_size, config, quant_config)
+        self.mlp = mlp_class(intermediate_size, config, quant_config, prefix=f"{prefix}.mlp")
 
     def forward(
         self,
@@ -230,6 +318,7 @@ class GLMModel(nn.Module):
         self,
         config: GLMConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = ""
     ):
         super().__init__()
         self.config = config
@@ -247,32 +336,32 @@ class GLMModel(nn.Module):
 
         self.embedding_dropout = torch.nn.Dropout(config.embedding_dropout_prob)
 
-        self.layers = nn.ModuleList(
-            [
-                GLMBlock(config, i, quant_config=quant_config)
-                for i in range(config.num_hidden_layers)
-            ]
-        )
         self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: GLMBlock(
                 layer_id=idx,
                 config=config,
                 quant_config=quant_config,
+                prefix=prefix
             ),
+            prefix=f"{prefix}.layers"
         )
 
-        self.final_layernorm = RMSNorm(self.embed_dim, eps=1.0e-5) if config.use_rmsnorm \
-            else nn.LayerNorm(self.embed_dim, eps=1.0e-5)
+        assert config.use_rmsnorm
+        self.final_layernorm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps)
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        hidden_states = self.word_embeddings(input_ids)
-        # hidden_states = self.embedding_dropout(hidden_states)
+        if input_embeds is None:
+            hidden_states = self.word_embeddings(input_ids)
+        else:
+            hidden_states = input_embeds
+
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
@@ -296,7 +385,7 @@ class GLMForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.transformer = GLMModel(config, quant_config)
+        self.transformer = GLMModel(config, quant_config, prefix="transformer")
         self.lm_head = self.transformer.lm_head
         self.logits_processor = LogitsProcessor(config)
 
@@ -308,7 +397,7 @@ class GLMForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        hidden_states = self.transformer(input_ids, positions, forward_batch)
+        hidden_states = self.transformer(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
@@ -338,10 +427,6 @@ class GLMForCausalLM(nn.Module):
                 name = 'transformer.' + name
             # moe router/gate改名
             name = name.replace('.router.classifier.', '.gate.')
-            # moe v1 - ffn去掉冗余的experts关键词
-            moe_mlp_v1 = bool('mlp.experts.' in name and self.config.mlp_version != "v2")
-            if moe_mlp_v1:
-                name = name.replace('mlp.experts.', 'mlp.')
             # moe v2改名
             name = name.replace('.expert_', '.')
 
