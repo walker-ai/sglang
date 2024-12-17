@@ -550,12 +550,32 @@ def launch_server(
             "fmt"
         ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
         LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+        # handler
+        LOGGING_CONFIG["handlers"] = {
+            "default": {
+                "formatter": "default",
+                "class": "logging.handlers.TimedRotatingFileHandler",
+                "filename": "/home/admin/logs/sglang_gw.log",
+                "when": "D",
+                "interval": 1,
+                "backupCount": 10,
+            },
+            "access": {
+                "formatter": "access",
+                "class": "logging.handlers.TimedRotatingFileHandler",
+                "filename": "/home/admin/logs/sglang_gw.log",
+                "when": "D",
+                "interval": 1,
+                "backupCount": 10,
+            },
+        }
 
         # Listen for HTTP requests
         uvicorn.run(
             app,
             host=server_args.host,
             port=server_args.port,
+            log_config=LOGGING_CONFIG,
             log_level=server_args.log_level_http or server_args.log_level,
             timeout_keep_alive=5,
             loop="uvloop",

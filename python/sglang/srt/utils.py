@@ -661,15 +661,52 @@ def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
     return model_path, tokenizer_path
 
 
+class NewLineFormatter(logging.Formatter):
+    """Adds logging prefix to newlines to align multi-line messages."""
+    def __init__(self, fmt, datefmt=None, style="%"):
+        logging.Formatter.__init__(self, fmt, datefmt, style)
+
+    def format(self, record):
+        msg = logging.Formatter.format(self, record)
+        if record.message != "":
+            parts = msg.split(record.message)
+            msg = msg.replace("\n", "\r\n" + parts[0])
+        return msg
+
+
 def configure_logger(server_args, prefix: str = ""):
-    format = f"[%(asctime)s{prefix}] %(message)s"
-    # format = f"[%(asctime)s.%(msecs)03d{prefix}] %(message)s"
-    logging.basicConfig(
-        level=getattr(logging, server_args.log_level.upper()),
-        format=format,
-        datefmt="%Y-%m-%d %H:%M:%S",
-        force=True,
-    )
+    _FORMAT = f"%(asctime)s %(levelname)s %(process)d [%(filename)s:%(lineno)d] %(message)s"
+    _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+    DEFAULT_LOGGING_CONFIG = {
+        "formatters": {
+            "sglang": {
+                "class": "sglang.srt.utils.NewLineFormatter",
+                "datefmt": _DATE_FORMAT,
+                "format": _FORMAT,
+            },
+        },
+        "handlers": {
+            "sglang": {
+                "class": "logging.handlers.TimedRotatingFileHandler",
+                "formatter": "sglang",
+                "level": server_args.log_level.upper(),
+                "filename": "/home/admin/logs/sglang.log",
+                "when": "D",
+                "interval": 1,
+                "backupCount": 10,
+            },
+        },
+        "loggers": {
+            "sglang": {
+                "handlers": ["sglang"],
+                "level": server_args.log_level.upper(),
+                "propagate": False,
+            },
+        },
+        "version": 1,
+        "disable_existing_loggers": False
+    }
+    logging.dictConfig(DEFAULT_LOGGING_CONFIG)
 
 
 # source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9

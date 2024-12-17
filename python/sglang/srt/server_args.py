@@ -81,8 +81,8 @@ class ServerArgs:
     # Logging
     log_level: str = "info"
     log_level_http: Optional[str] = None
-    log_requests: bool = False
-    show_time_cost: bool = False
+    log_requests: bool = True
+    show_time_cost: bool = True
     enable_metrics: bool = False
     decode_log_interval: int = 40
 
