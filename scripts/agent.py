@@ -41,11 +41,6 @@ def setup_logging(logfile=None, console_min_level=logging.INFO, file_min_level=l
     hdlr.setLevel(file_min_level)
     hdlr.setFormatter(fmter)
     logger.addHandler(hdlr)
-    # console_hdlr = logging.StreamHandler()
-    # console_hdlr.setLevel(logging.INFO)
-    # fmter = logging.Formatter('%(message)s')
-    # console_hdlr.setFormatter(fmter)
-    # logger.addHandler(console_hdlr)
     logger.setLevel(logging.INFO)
 
 
@@ -104,6 +99,15 @@ def count_files_and_dirs(directory):
     return num_files + num_dirs, subdirs
 
 
+def get_all_children_pid(parent_pid):
+    try:
+        parent = psutil.Process(parent_pid)
+    except psutil.NoSuchProcess:
+        return []
+    children = parent.children(recursive=True)
+    return [str(process.pid) for process in children]
+
+
 def kill_child_processes(parent_pid, sig=signal.SIGTERM):
     try:
         parent = psutil.Process(parent_pid)
@@ -136,9 +140,16 @@ def popen_exec(cmd):
 def check_process_exists(command):
     for process in psutil.process_iter(['pid', 'cmdline']):
         if process.info['cmdline'] and command in process.info['cmdline']:
-            return True
-    return False
+            return True, process.pid
+    return False, 0
 
+
+def kill_sglang_processes(pid_list):
+    pid_str = ' '.join(pid_list)
+    try:
+        popen_exec(f'kill -9 {pid_str}')
+    except Exception as e:
+        glogger.info('kill sglang processes failed: %s', e)
 
 def check_port_open(server_ip, server_port):
     ip_port = (server_ip, server_port)
@@ -183,6 +194,8 @@ class ServerState(Enum):
     not_exist = 1
     initting = 2
     started = 3
+    unhealthy = 4
+    suspended = 5
 
 
 class SGlangAgent:
@@ -191,11 +204,19 @@ class SGlangAgent:
     def __init__(self, port: int = 8189, lock_port: int = 12332):
         self.port = port
         self.lock_port = lock_port
+        self.unhealthy_cnt = 0
+        self.sglang_pid_list = []
 
     def start_server(self, **kwargs):
         glogger.info(f'try to start sglang server with args: {kwargs}')
-        # 杀死子进程
+        # 杀死agent的子进程
         kill_child_processes(os.getpid())
+
+        # 杀死sglang的残留进程
+        if self.sglang_pid_list:
+            kill_sglang_processes(self.sglang_pid_list)
+            self.sglang_pid_list.clear()
+
         server_args = ''
         for k, v in kwargs.items():
             k = k.replace('_', '-')
@@ -205,18 +226,30 @@ class SGlangAgent:
 
     def get_server_state(self) -> ServerState:
         # 进程是否存在检查
-        processs_exist = check_process_exists(self.server_cmd)
+        processs_exist, _ = check_process_exists(self.server_cmd)
         glogger.info(f'processs_exist::{processs_exist}')
         if not processs_exist:
             return ServerState.not_exist
 
         local_ip = "127.0.0.1"
+
         # # 进程存在且端口已经打开，则认为已经启动成功
         if check_port_open(local_ip, self.port):
             if sglang_health_check(local_ip, self.port):
+                glogger.info('sglang server is healthy')
+                self.unhealthy_cnt = 0
                 return ServerState.started
             else:
-                return ServerState.not_exist
+                self.unhealthy_cnt += 1
+                # 连续 3 次不健康，则认为引擎健康状态检查失败
+                if self.unhealthy_cnt > 3:
+                    glogger.error('sglang server is not healthy!!!')
+                    self.unhealthy_cnt = 0
+                    return ServerState.unhealthy
+                else:
+                    glogger.warning(f'sglang server is not healthy ({self.unhealthy_cnt}), sleep and try again.')
+                    time.sleep(10)
+                    return ServerState.suspended
         # 进程存在但端口未打开，则认为server在启动中
         else:
             return ServerState.initting
@@ -236,14 +269,28 @@ class SGlangAgent:
                         glogger.info('launcher_state is:%s', state)
                         if state == ServerState.not_exist:
                             # 进程不存在，启动server
+                            glogger.error('server is not exist, start server...')
                             self.start_server(**kwargs)
                         elif state == ServerState.initting:
                             # 启动中
-                            glogger.info('wait server')
+                            glogger.info('wait server initting...')
+                        elif state == ServerState.suspended:
+                            # 不健康挂起中
+                            glogger.error('server is not healthy, suspending...')
+                        elif state == ServerState.unhealthy:
+                            # 健康检查失败
+                            glogger.error('server is not healthy, restart server...')
+                            self.start_server(**kwargs)
                         else:
-                            # 已经启动
-                            glogger.info('started')
-                        time.sleep(3)
+                            # 第一次启动成功，记录所有的pid
+                            if not self.sglang_pid_list:
+                                processs_exist, sglang_server_pid = check_process_exists(self.server_cmd)
+                                if processs_exist:
+                                    self.sglang_pid_list.append(str(sglang_server_pid))
+                                    self.sglang_pid_list.extend(get_all_children_pid(sglang_server_pid))
+                            # 启动状态打印
+                            glogger.info(f'server started, pid = {self.sglang_pid_list}')
+                        time.sleep(5)
                     except Exception as e:
                         glogger.info('agent process exception:%s', e)
             finally:
