@@ -706,7 +706,7 @@ def configure_logger(server_args, prefix: str = ""):
         "version": 1,
         "disable_existing_loggers": False
     }
-    logging.dictConfig(DEFAULT_LOGGING_CONFIG)
+    logging.config.dictConfig(DEFAULT_LOGGING_CONFIG)
 
 
 # source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9
