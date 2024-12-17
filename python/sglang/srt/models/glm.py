@@ -494,12 +494,8 @@ class GLMForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
 
 
-# class GLMForConditionalGeneration(GLMForCausalLM):
-#     pass
+class GLMForConditionalGeneration(GLMForCausalLM):
+    pass
 
-# class GLMModel(GLMForCausalLM):
-#     pass
 
-# EntryClass = [GLMForCausalLM, GLMForConditionalGeneration, GLMModel]
-
-EntryClass = [GLMForCausalLM]
+EntryClass = [GLMForCausalLM, GLMForConditionalGeneration]
