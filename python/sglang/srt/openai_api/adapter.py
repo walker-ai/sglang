@@ -698,11 +698,7 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
 async def v1_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
     all_requests = [CompletionRequest(**request_json)]
-
-    trace_id = request_json.pop("trace_id", None)
-    all_request_ids = [trace_id] if trace_id else None
-
-    adapted_request, request = v1_generate_request(all_requests, all_request_ids)
+    adapted_request, request = v1_generate_request(all_requests)
 
     if adapted_request.stream:
 
@@ -1123,11 +1119,7 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
 async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
     all_requests = [ChatCompletionRequest(**request_json)]
-
-    trace_id = request_json.pop("trace_id", None)
-    all_request_ids = [trace_id] if trace_id else None
-
-    adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager, all_request_ids)
+    adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
 
     if adapted_request.stream:
 
