@@ -178,6 +178,9 @@ class CompletionRequest(BaseModel):
     ignore_eos: bool = False
     skip_special_tokens: bool = True
 
+    # trace_id
+    trace_id: Optional[str] = None
+
 
 class CompletionResponseChoice(BaseModel):
     index: int
@@ -283,6 +286,9 @@ class ChatCompletionRequest(BaseModel):
     no_stop_trim: bool = False
     ignore_eos: bool = False
     skip_special_tokens: bool = True
+
+    # trace_id
+    trace_id: Optional[str] = None
 
 
 class ChatMessage(BaseModel):
