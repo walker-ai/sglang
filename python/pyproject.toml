@@ -81,3 +81,6 @@ exclude = [
     "scripts*",
     "tests*",
 ]
+
+[tool.setuptools.package-data]
+"sglang" = ["sglang/srt/layers/fused_moe_triton/configs/*.json"]
