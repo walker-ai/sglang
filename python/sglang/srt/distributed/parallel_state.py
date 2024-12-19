@@ -961,7 +961,7 @@ def init_distributed_environment(
     local_rank: int = -1,
     backend: str = "nccl",
 ):
-    logger.debug(
+    logger.info(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
         world_size,
         rank,

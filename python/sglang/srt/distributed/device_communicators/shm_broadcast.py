@@ -273,7 +273,7 @@ class MessageQueue:
             self.local_socket.setsockopt(XPUB_VERBOSE, True)
             local_subscribe_port = get_open_port()
             socket_addr = f"tcp://127.0.0.1:{local_subscribe_port}"
-            logger.debug("Binding to %s", socket_addr)
+            logger.info("Binding to %s", socket_addr)
             self.local_socket.bind(socket_addr)
 
             self.current_idx = 0
@@ -337,7 +337,7 @@ class MessageQueue:
             self.local_socket = context.socket(SUB)
             self.local_socket.setsockopt_string(SUBSCRIBE, "")
             socket_addr = f"tcp://127.0.0.1:{handle.local_subscribe_port}"
-            logger.debug("Connecting to %s", socket_addr)
+            logger.info("Connecting to %s", socket_addr)
             self.local_socket.connect(socket_addr)
 
             self.remote_socket = None
@@ -355,7 +355,7 @@ class MessageQueue:
             if is_valid_ipv6_address(handle.connect_ip):
                 self.remote_socket.setsockopt(IPV6, 1)
             socket_addr = f"tcp://{handle.connect_ip}:{handle.remote_subscribe_port}"
-            logger.debug("Connecting to %s", socket_addr)
+            logger.info("Connecting to %s", socket_addr)
             self.remote_socket.connect(socket_addr)
 
         return self

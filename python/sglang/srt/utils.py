@@ -594,7 +594,7 @@ def maybe_set_triton_cache_manager() -> None:
     cache_manger = os.environ.get("TRITON_CACHE_MANAGER", None)
     if cache_manger is None:
         manager = "sglang.srt.utils:CustomCacheManager"
-        logger.debug("Setting Triton cache manager to: %s", manager)
+        logger.info("Setting Triton cache manager to: %s", manager)
         os.environ["TRITON_CACHE_MANAGER"] = manager
 
 
@@ -894,14 +894,14 @@ def set_prometheus_multiproc_dir():
     global prometheus_multiproc_dir
 
     if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
-        logger.debug("User set PROMETHEUS_MULTIPROC_DIR detected.")
+        logger.info("User set PROMETHEUS_MULTIPROC_DIR detected.")
         prometheus_multiproc_dir = tempfile.TemporaryDirectory(
             dir=os.environ["PROMETHEUS_MULTIPROC_DIR"]
         )
     else:
         prometheus_multiproc_dir = tempfile.TemporaryDirectory()
         os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
-    logger.debug(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
+    logger.info(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
 
 
 def add_prometheus_middleware(app):
