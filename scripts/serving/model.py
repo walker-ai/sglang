@@ -511,7 +511,8 @@ class LegacyEntrypointRequestHandler(OpenAIEntrypointRequestHandler):
         max_output_length = payload.get("max_output_length",
                                         DEFAULT_MAX_OUTPUT_LENGTH)
         # 期望最大输出超长后的限制
-        if max_output_length > SUPPORTED_MAX_OUTPUT_LENGTH:
+        if (max_output_length is not None and
+                max_output_length > SUPPORTED_MAX_OUTPUT_LENGTH):
             logger.info(f"[{trace_id}] decrease max_output_length(max_tokens) "
                         f"from {max_output_length} to {SUPPORTED_MAX_OUTPUT_LENGTH}.")
             max_output_length = SUPPORTED_MAX_OUTPUT_LENGTH
