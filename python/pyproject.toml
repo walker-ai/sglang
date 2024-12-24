@@ -61,7 +61,7 @@ dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
 "Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
 
 [tool.setuptools.package-data]
-"sglang" = ["srt/layers/fused_moe_triton/configs/*.json"]
+"sglang" = ["srt/layers/moe/fused_moe_triton/configs/*.json"]
 
 [tool.setuptools.packages.find]
 exclude = [
