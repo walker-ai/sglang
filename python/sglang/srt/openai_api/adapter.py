@@ -517,6 +517,7 @@ def v1_generate_request(
                 "repetition_penalty": request.repetition_penalty,
                 "regex": request.regex,
                 "json_schema": request.json_schema,
+                "ebnf": request.ebnf,
                 "n": request.n,
                 "no_stop_trim": request.no_stop_trim,
                 "ignore_eos": request.ignore_eos,
@@ -699,6 +700,14 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
 
 async def v1_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
+    if "extra_body" in request_json:
+        extra = request_json["extra_body"]
+        if "ebnf" in extra:
+            request_json["ebnf"] = extra["ebnf"]
+        if "regex" in extra:
+            request_json["regex"] = extra["regex"]
+        # remove extra_body to avoid pydantic conflict
+        del request_json["extra_body"]
     all_requests = [CompletionRequest(**request_json)]
     adapted_request, request = v1_generate_request(all_requests)
 
@@ -954,6 +963,7 @@ def v1_chat_generate_request(
             "frequency_penalty": request.frequency_penalty,
             "repetition_penalty": request.repetition_penalty,
             "regex": request.regex,
+            "ebnf": request.ebnf,
             "n": request.n,
             "no_stop_trim": request.no_stop_trim,
             "ignore_eos": request.ignore_eos,
@@ -1126,6 +1136,15 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
 
 async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
+    if "extra_body" in request_json:
+        extra = request_json["extra_body"]
+        # For example, if 'ebnf' is given:
+        if "ebnf" in extra:
+            request_json["ebnf"] = extra["ebnf"]
+        if "regex" in extra:
+            request_json["regex"] = extra["regex"]
+        # remove extra_body to avoid pydantic conflict
+        del request_json["extra_body"]
     all_requests = [ChatCompletionRequest(**request_json)]
     adapted_request, request = v1_chat_generate_request(all_requests, tokenizer_manager)
 
