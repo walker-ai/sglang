@@ -1,8 +1,9 @@
 [sglang.boot]
-mem_fraction_static = 0.88
+mem_fraction_static = 0.9
 dtype = "bfloat16"
 max_running_requests = 64
 trust_remote_code = ""
 enable_cache_report = ""
 log_level = "info"
-chunked_prefill_size = 2048
+chunked_prefill_size = 4096
+served_model_name = "auto"
