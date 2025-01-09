@@ -85,7 +85,7 @@ class ServerArgs:
     log_level: str = "info"
     log_level_http: Optional[str] = None
     log_requests: bool = True
-    show_time_cost: bool = True
+    show_time_cost: bool = False
     enable_metrics: bool = True
     decode_log_interval: int = 40
 
@@ -541,7 +541,6 @@ class ServerArgs:
         parser.add_argument(
             "--show-time-cost",
             action="store_true",
-            default=ServerArgs.show_time_cost,
             help="Show time cost of custom marks.",
         )
         parser.add_argument(
