@@ -307,7 +307,7 @@ class OpenAIEntrypointRequestHandler:
 
         # 在 trace_id 基础上增加随机数，防止同一个 trace 多次并行调用导致的 sglang 状态不一致
         # TODO(yudian.zy) 当前sglang还不支持传入自定义的request id
-        sglang_trace_id = trace_id + '_' + str(uuid.uuid1()).replace('-', '')[:8]
+        sglang_trace_id = trace_id + '_' + str(uuid.uuid1().hex)[:8]
         payload['trace_id'] = sglang_trace_id
 
         if not payload.get('top_k'):
@@ -581,7 +581,7 @@ class LegacyEntrypointRequestHandler(OpenAIEntrypointRequestHandler):
         messages = self._build_chat_completion_messages(
             user_query, system_prompt=system_prompt, chat_history=chat_history)
 
-        sglang_trace_id = trace_id + "_" + str(uuid.uuid1()).replace('-', '')[:8]
+        sglang_trace_id = trace_id + "_" + str(uuid.uuid1().hex)[:8]
 
         # 底层使用 OpenAI 兼容的 ChatCompletion API
         sglang_request = {
@@ -713,7 +713,7 @@ class LegacyEntrypointRequestHandler(OpenAIEntrypointRequestHandler):
                                   top_p=DEFAULT_TOP_P,
                                   top_k=DEFAULT_TOP_K):
 
-        sglang_trace_id = trace_id + "_" + str(uuid.uuid1()).replace('-', '')[:8]
+        sglang_trace_id = trace_id + "_" + str(uuid.uuid1().hex)[:8]
 
         # 底层使用 OpenAI 兼容的 completion API
         sglang_request = {

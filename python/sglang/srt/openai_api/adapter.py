@@ -704,7 +704,7 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
 async def v1_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
     # 外部传入trace_id
-    trace_id = request_json.pop("trace_id", None)
+    trace_id = get_trace_id(request_json)
     request_ids = [trace_id] if trace_id else None
 
     all_requests = [CompletionRequest(**request_json)]
@@ -1193,7 +1193,7 @@ def v1_chat_generate_response(request, ret, to_file=False, cache_report=False):
 async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
     # 外部传入trace_id
-    trace_id = request_json.pop("trace_id", None)
+    trace_id = get_trace_id(request_json)
     request_ids = [trace_id] if trace_id else None
 
     all_requests = [ChatCompletionRequest(**request_json)]
@@ -1453,6 +1453,11 @@ async def v1_embeddings(tokenizer_manager, raw_request: Request):
 
     return response
 
+def get_trace_id(req_json):
+    trace_id = req_json.pop("trace_id", None)
+    if not trace_id:
+        return trace_id
+    return trace_id + '_' + str(uuid.uuid4().hex)[:8]
 
 def to_openai_style_logprobs(
     input_token_logprobs=None,
