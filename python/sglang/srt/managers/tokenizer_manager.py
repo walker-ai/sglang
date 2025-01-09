@@ -338,7 +338,7 @@ class TokenizerManager:
             if state.finished:
                 if self.server_args.log_requests:
                     msg = f"Finish: obj={dataclass_to_string_truncated(obj)}, out={dataclass_to_string_truncated(out)}"
-                    logger.info(msg)
+                    logger.info("%r", msg)
                 del self.rid_to_state[obj.rid]
                 yield out
                 break
