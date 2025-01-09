@@ -181,6 +181,8 @@ class CompletionRequest(BaseModel):
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
 
+    trace_id: Optional[str] = None
+
 
 class CompletionResponseChoice(BaseModel):
     index: int
@@ -322,6 +324,8 @@ class ChatCompletionRequest(BaseModel):
     ignore_eos: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+
+    trace_id: Optional[str] = None
 
 
 class FunctionResponse(BaseModel):
