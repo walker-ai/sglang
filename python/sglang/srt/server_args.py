@@ -86,7 +86,7 @@ class ServerArgs:
     log_level_http: Optional[str] = None
     log_requests: bool = True
     show_time_cost: bool = True
-    enable_metrics: bool = False
+    enable_metrics: bool = True
     decode_log_interval: int = 40
 
     # API related
