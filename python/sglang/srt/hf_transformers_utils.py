@@ -30,22 +30,15 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
-try:
-    from vllm.transformers_utils.configs import ChatGLMConfig, DbrxConfig
-    from sglang.srt.configs.glm import GLMConfig
+from sglang.srt.configs import ChatGLMConfig, DbrxConfig, ExaoneConfig, Qwen2VLConfig, GLMConfig
 
-    from sglang.srt.configs import ExaoneConfig, Qwen2VLConfig
-
-    _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
-        ChatGLMConfig.model_type: ChatGLMConfig,
-        DbrxConfig.model_type: DbrxConfig,
-        ExaoneConfig.model_type: ExaoneConfig,
-        Qwen2VLConfig.model_type: Qwen2VLConfig,
-        GLMConfig.model_type: GLMConfig,
-    }
-except ImportError:
-    # We want this file to run without vllm dependency
-    _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {}
+_CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
+    ChatGLMConfig.model_type: ChatGLMConfig,
+    DbrxConfig.model_type: DbrxConfig,
+    ExaoneConfig.model_type: ExaoneConfig,
+    Qwen2VLConfig.model_type: Qwen2VLConfig,
+    GLMConfig.model_type: GLMConfig,
+}
 
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
