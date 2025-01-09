@@ -535,16 +535,19 @@ class ServerArgs:
         parser.add_argument(
             "--log-requests",
             action="store_true",
+            default=ServerArgs.log_requests,
             help="Log the inputs and outputs of all requests.",
         )
         parser.add_argument(
             "--show-time-cost",
             action="store_true",
+            default=ServerArgs.show_time_cost,
             help="Show time cost of custom marks.",
         )
         parser.add_argument(
             "--enable-metrics",
             action="store_true",
+            default=ServerArgs.enable_metrics,
             help="Enable log prometheus metrics.",
         )
         parser.add_argument(
