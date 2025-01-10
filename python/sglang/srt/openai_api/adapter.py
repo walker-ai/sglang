@@ -543,6 +543,7 @@ def v1_generate_request(
         logprob_start_lens = logprob_start_lens[0]
         top_logprobs_nums = top_logprobs_nums[0]
         lora_paths = lora_paths[0]
+        request_ids = request_ids[0] if request_ids else None
     else:
         if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
             prompt_kwargs = {"text": prompts}
