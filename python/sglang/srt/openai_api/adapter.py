@@ -1456,7 +1456,7 @@ async def v1_embeddings(tokenizer_manager, raw_request: Request):
 def get_trace_id(req_json):
     trace_id = req_json.pop("trace_id", None)
     if not trace_id:
-        return trace_id
+        return None
     return trace_id + '_' + str(uuid.uuid4().hex)[:8]
 
 def to_openai_style_logprobs(
