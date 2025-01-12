@@ -216,7 +216,7 @@ class TokenizerManager:
         obj.normalize_batch_and_arguments()
 
         if self.server_args.log_requests:
-            logger.info(f"Receive: obj={dataclass_to_string_truncated(obj)}")
+            logger.info(f"Receive: obj={dataclass_to_string_truncated(obj)!r}")
 
         async with self.model_update_lock.reader_lock:
             is_single = obj.is_single
