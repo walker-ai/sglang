@@ -4,6 +4,7 @@ dtype = "bfloat16"
 max_running_requests = 64
 trust_remote_code = ""
 enable_cache_report = ""
+enable_mixed_chunk = ""
 log_level = "info"
 chunked_prefill_size = 4096
 served_model_name = "auto"
