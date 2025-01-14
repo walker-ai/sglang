@@ -88,11 +88,10 @@ class ServerArgs:
     show_time_cost: bool = False
     enable_metrics: bool = True
     decode_log_interval: int = 40
-    dump_requests_folder: str = ""
 
     # API related
     api_key: Optional[str] = None
-    file_storage_pth: str = "SGLang_storage"
+    file_storage_pth: str = "sglang_storage"
     enable_cache_report: bool = False
 
     # Data parallelism
@@ -157,6 +156,7 @@ class ServerArgs:
     triton_attention_num_kv_splits: int = 8
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
+    enable_memory_saver: bool = False
 
     def __post_init__(self):
         # Set missing default values
@@ -558,12 +558,6 @@ class ServerArgs:
             default=ServerArgs.decode_log_interval,
             help="The log interval of decode batch.",
         )
-        parser.add_argument(
-            "--dump-requests-folder",
-            type=str,
-            default=ServerArgs.decode_log_interval,
-            help="Dump raw requests to a folder for replay.",
-        )
 
         # API related
         parser.add_argument(
@@ -861,6 +855,11 @@ class ServerArgs:
             "--delete-ckpt-after-loading",
             action="store_true",
             help="Delete the model checkpoint after loading the model.",
+        )
+        parser.add_argument(
+            "--enable-memory-saver",
+            action="store_true",
+            help="Allow saving memory using release_memory_occupation and resume_memory_occupation",
         )
 
     @classmethod
