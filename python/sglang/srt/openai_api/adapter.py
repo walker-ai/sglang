@@ -20,7 +20,7 @@ import os
 import time
 import uuid
 from http import HTTPStatus
-from typing import Dict, List
+from typing import Dict, List, Final
 
 from fastapi import HTTPException, Request, UploadFile
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -712,6 +712,9 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
     adapted_request, request = v1_generate_request(
         all_requests, request_ids=request_ids)
 
+    # 返回的chunk类型
+    chunk_object_type: Final = "text_completion"
+
     if adapted_request.stream:
 
         async def generate_stream_resp():
@@ -805,7 +808,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     )
                     chunk = CompletionStreamResponse(
                         id=content["meta_info"]["id"],
-                        object="text_completion",
+                        object=chunk_object_type,
                         choices=[choice_data],
                         model=request.model,
                     )
@@ -840,6 +843,8 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
 
                     final_usage_chunk = CompletionStreamResponse(
                         id=(trace_id or str(uuid.uuid4().hex)),
+                        object=chunk_object_type,
+                        created=int(time.time()),
                         choices=[],
                         model=request.model,
                         usage=usage,
@@ -1201,6 +1206,9 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
     adapted_request, request = v1_chat_generate_request(
         all_requests, tokenizer_manager, request_ids=request_ids)
 
+    # 返回的chunk类型
+    chunk_object_type: Final = "chat.completion.chunk"
+
     if adapted_request.stream:
 
         async def generate_stream_resp():
@@ -1300,7 +1308,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     stream_buffer = stream_buffer + delta
                     choice_data = ChatCompletionResponseStreamChoice(
                         index=index,
-                        delta=DeltaMessage(content=delta),
+                        delta=DeltaMessage(role="assistant", content=delta),
                         finish_reason=(finish_reason["type"] if finish_reason else ""),
                         matched_stop=(
                             finish_reason["matched"]
@@ -1344,6 +1352,8 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
 
                     final_usage_chunk = ChatCompletionStreamResponse(
                         id=(trace_id or str(uuid.uuid4().hex)),
+                        object=chunk_object_type,
+                        created=int(time.time()),
                         choices=[],
                         model=request.model,
                         usage=usage,
