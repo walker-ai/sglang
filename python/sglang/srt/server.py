@@ -611,14 +611,14 @@ def launch_server(
     try:
         # Update logging configs
         set_uvicorn_logging_configs()
-        from uvicorn.config import LOGGING_CONFIG
+        # from uvicorn.config import LOGGING_CONFIG
 
         # Listen for HTTP requests
         uvicorn.run(
             app,
             host=server_args.host,
             port=server_args.port,
-            log_config=LOGGING_CONFIG,
+            # log_config=LOGGING_CONFIG,
             log_level=server_args.log_level_http or server_args.log_level,
             timeout_keep_alive=5,
             loop="uvloop",
