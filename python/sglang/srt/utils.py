@@ -59,6 +59,7 @@ from triton.runtime.cache import (
     default_dump_dir,
     default_override_dir,
 )
+from uvicorn.config import LOGGING_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -825,7 +826,9 @@ def first_rank_print(*args, **kwargs):
         pass
 
 
-def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: str):
+def get_zmq_socket(
+    context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
+):
     mem = psutil.virtual_memory()
     total_mem = mem.total / 1024**3
     available_mem = mem.available / 1024**3
@@ -838,13 +841,16 @@ def get_zmq_socket(context: zmq.Context, socket_type: zmq.SocketType, endpoint: 
     if socket_type == zmq.PUSH:
         socket.setsockopt(zmq.SNDHWM, 0)
         socket.setsockopt(zmq.SNDBUF, buf_size)
-        socket.connect(f"ipc://{endpoint}")
     elif socket_type == zmq.PULL:
         socket.setsockopt(zmq.RCVHWM, 0)
         socket.setsockopt(zmq.RCVBUF, buf_size)
-        socket.bind(f"ipc://{endpoint}")
     else:
         raise ValueError(f"Unsupported socket type: {socket_type}")
+
+    if bind:
+        socket.bind(endpoint)
+    else:
+        socket.connect(endpoint)
 
     return socket
 
@@ -1441,3 +1447,33 @@ def nullable_str(val: str):
     if not val or val == "None":
         return None
     return val
+
+
+def set_uvicorn_logging_configs():
+    LOGGING_CONFIG["formatters"]["default"][
+        "fmt"
+    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
+    LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+    LOGGING_CONFIG["formatters"]["access"][
+        "fmt"
+    ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
+    LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+    # handler
+    LOGGING_CONFIG["handlers"] = {
+        "default": {
+            "formatter": "default",
+            "class": "logging.handlers.TimedRotatingFileHandler",
+            "filename": "/home/admin/logs/sglang_gw.log",
+            "when": "D",
+            "interval": 1,
+            "backupCount": 10,
+        },
+        "access": {
+            "formatter": "access",
+            "class": "logging.handlers.TimedRotatingFileHandler",
+            "filename": "/home/admin/logs/sglang_gw.log",
+            "when": "D",
+            "interval": 1,
+            "backupCount": 10,
+        },
+    }
