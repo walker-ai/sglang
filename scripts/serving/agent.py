@@ -222,7 +222,7 @@ class SGlangAgent:
             k = k.replace('_', '-')
             server_args += f'--{k} {v} '
         popen_exec(
-            f'export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256 && export RAY_memory_monitor_refresh_ms=0 && export PYTHONUSERBASE=intentionally-disabled && python -m {self.server_cmd} --host 127.0.0.1 {server_args} 2>&1 &')
+            f'export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:256 && export RAY_memory_monitor_refresh_ms=0 && export PYTHONUSERBASE=intentionally-disabled && python -m {self.server_cmd} --host 0.0.0.0 {server_args} 2>&1 &')
 
     def get_server_state(self) -> ServerState:
         # 进程是否存在检查
