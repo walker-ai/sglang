@@ -825,6 +825,9 @@ class LegacyEntrypointRequestHandler(OpenAIEntrypointRequestHandler):
             yield res
 
     def _is_query_contains_chat_template(self, query: str) -> bool:
+        # deepseek v3 & r1
+        if ('<｜begin▁of▁sentence｜>' in query):
+            return True
         # 百灵 ChatML
         if (('<role>HUMAN</role>' in query)
             or ('<role>SYSTEM</role>' in query)):
