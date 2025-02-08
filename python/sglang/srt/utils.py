@@ -637,6 +637,7 @@ class NewLineFormatter(logging.Formatter):
 
 
 def configure_logger(server_args, prefix: str = ""):
+    import concurrent_log_handler  # noqa: F401
     _FORMAT = f"%(asctime)s %(levelname)s %(process)d [%(filename)s:%(lineno)d] %(message)s"
     _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
     DEFAULT_LOGGING_CONFIG = {
@@ -649,13 +650,12 @@ def configure_logger(server_args, prefix: str = ""):
         },
         "handlers": {
             "sglang": {
-                "class": "logging.handlers.TimedRotatingFileHandler",
+                "class": "concurrent_log_handler.ConcurrentRotatingFileHandler",
                 "formatter": "sglang",
                 "level": server_args.log_level.upper(),
                 "filename": "/home/admin/logs/sglang.log",
-                "when": "D",
-                "interval": 1,
-                "backupCount": 10,
+                "maxBytes": 104857600,  # 100*1024*1024=100 MiB
+                "backupCount": 20,
             },
         },
         "loggers": {
@@ -1266,9 +1266,9 @@ def dataclass_to_string_truncated(data, max_length=2048):
         return (
             "{"
             + ", ".join(
-                f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
-                for k, v in data.items()
-            )
+            f"'{k}': {dataclass_to_string_truncated(v, max_length)}"
+            for k, v in data.items()
+        )
             + "}"
         )
     elif dataclasses.is_dataclass(data):
@@ -1276,9 +1276,9 @@ def dataclass_to_string_truncated(data, max_length=2048):
         return (
             f"{data.__class__.__name__}("
             + ", ".join(
-                f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
-                for f in fields
-            )
+            f"{f.name}={dataclass_to_string_truncated(getattr(data, f.name), max_length)}"
+            for f in fields
+        )
             + ")"
         )
     else:
