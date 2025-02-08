@@ -18,20 +18,20 @@ import triton_python_backend_utils as pb_utils
 # 组件使用文档，详见 https://yuque.antfin-inc.com/aii/aistudio/nkyse5
 # python lib 依赖写入 requirement.txt
 
-SERVER_ADDRESS = "http://127.0.0.1:9122"
+SERVER_ADDRESS = "http://127.0.0.1:8188"
 STREAM_CHUNK_SIZE = 8192
 STREAM_DELIMITER = b"\n\n"
 
 DEFAULT_GPU_UTILIZATION = 0.88
 
-DEFAULT_MAX_OUTPUT_LENGTH = 1024
+DEFAULT_MAX_OUTPUT_LENGTH = 2048
 SUPPORTED_MAX_OUTPUT_LENGTH = 4096
 DEFAULT_BEAM_WIDTH = 1
 DEFAULT_TEMPERATURE = 0.4
 DEFAULT_TOP_K = 20
 DEFAULT_TOP_P = 0.95
 DEFAULT_DO_SAMPLE = False
-STREAM_TIMEOUT_SECONDS = 120
+STREAM_TIMEOUT_SECONDS = 180
 TOKENIZER_TIMEOUT_SECONDS = 5
 
 ENTRY_POINT_KEY = "__entry_point__"
@@ -130,7 +130,7 @@ class TritonPythonModel:
         import agent
 
         if not agent.try_wait_sglang_server(
-            self.model_path, port=9122, **sglang_boot_args):
+            self.model_path, port=8188, **sglang_boot_args):
             raise Exception('>>> [initialize] Start SGLang server failed!!!')
 
         try:
