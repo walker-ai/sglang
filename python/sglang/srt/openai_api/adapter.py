@@ -940,7 +940,6 @@ def v1_chat_generate_request(
                     prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
                         openai_compatible_messages,
                         tokenize=True,
-                        # todo，放到入参里？
                         add_generation_prompt=True,
                         tools=tools,
                     )
