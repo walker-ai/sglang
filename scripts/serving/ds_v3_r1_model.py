@@ -315,7 +315,7 @@ class OpenAIEntrypointRequestHandler:
             payload['model'] = 'auto'
 
         # r1多轮移除思考的部分
-        payload["messages"] = self._refine_thinking_messages(payload["messages"])
+        assistant_prefix, payload["messages"] = self._refine_thinking_messages(payload["messages"])
 
         response = self._do_chat_completion(payload)
         logger.info(f"[{trace_id}] >>> Received response: {response}")
@@ -368,7 +368,7 @@ class OpenAIEntrypointRequestHandler:
                     if choices:
                         content = choices[0]["delta"].get("content", "")
                         if not content.startswith("<think>"):
-                            choices[0]["delta"]["content"] = f"<think>\n{content}"
+                            choices[0]["delta"]["content"] = f"<think>\n{assistant_prefix}{content}"
                     chunk = json.dumps(result_obj, ensure_ascii=False)
                 is_first_token = False
 
@@ -389,7 +389,8 @@ class OpenAIEntrypointRequestHandler:
             choices = result_obj.get("choices", [])
             if choices and not choices[0]["message"]["content"].startswith("<think>"):
                 # 补丁，官方chat-template有问题，改成了前两个tokens必出<think>\n的，因此输出加上这俩
-                choices[0]["message"]["content"] = "<think>\n" + choices[0]["message"]["content"]
+                origin_content = choices[0]["message"]["content"]
+                choices[0]["message"]["content"] = f"<think>\n{assistant_prefix}{origin_content}"
             all_chunks = json.dumps(result_obj, ensure_ascii=False)
 
             res = {
@@ -418,19 +419,23 @@ class OpenAIEntrypointRequestHandler:
 
     def _refine_thinking_messages(self, messages):
         refine_message = []
-        for msg_body in messages:
+        assistant_prefix = ""
+        last_index = len(messages) - 1
+        for idx, msg_body in enumerate(messages):
             if msg_body["role"] == "system" and msg_body["content"] and msg_body["content"].startswith(
                 "You are a helpful assistant"):
                 # 跳过平台默认加的system role
                 continue
-            if msg_body["role"] == "assistant":
+            if msg_body["role"] == "assistant" and idx != last_index:
                 content = msg_body["content"]
-                think_end_idx = content.find("</think>")
+                think_end_idx = content.rfind("</think>")
                 if content.startswith("<think>") and think_end_idx > 0:
                     content = content[(think_end_idx + len("</think>")):].lstrip()
                 msg_body["content"] = content
+            if msg_body["role"] == "assistant" and idx == last_index:
+                assistant_prefix = msg_body["content"]
             refine_message.append(msg_body)
-        return refine_message
+        return assistant_prefix, refine_message
 
     def _do_tokenization(
         self,
@@ -914,7 +919,7 @@ class LegacyEntrypointRequestHandler(OpenAIEntrypointRequestHandler):
         if user_query:
             messages.append({"role": "user", "content": user_query})
         # r1多轮移除思考的部分
-        messages = self._refine_thinking_messages(messages)
+        _, messages = self._refine_thinking_messages(messages)
         return messages
 
 
