@@ -664,16 +664,16 @@ class _RequestLogger:
 
     def log_generation(self, obj):
         if self.log_requests:
-            max_length = 2048 if self.log_requests_level == 0 else 1 << 30
+            max_length = 4096 if self.log_requests_level == 0 else 1 << 30
             logger.info(
-                f"Receive: obj={dataclass_to_string_truncated(obj, max_length)}"
+                f"Receive: obj={dataclass_to_string_truncated(obj, max_length)!r}"
             )
 
     def log_response(self, obj, out):
         if self.log_requests:
-            max_length = 2048 if self.log_requests_level == 0 else 1 << 30
-            msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length)}, out={dataclass_to_string_truncated(out, max_length)}"
-            logger.info(msg)
+            max_length = 4096 if self.log_requests_level == 0 else 1 << 30
+            msg = f"Finish: out={dataclass_to_string_truncated(out, max_length)}"
+            logger.info("%r", msg)
 
 
 class _RequestDumper:
