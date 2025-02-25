@@ -699,7 +699,7 @@ def v1_generate_response(request, ret, tokenizer_manager, to_file=False):
         completion_tokens = sum(item["meta_info"]["completion_tokens"] for item in ret)
 
         cached_tokens = sum(item["meta_info"].get("cached_tokens", 0) for item in ret)
-        cache_report = orchestrator.server_args.enable_cache_report
+        cache_report = tokenizer_manager.server_args.enable_cache_report
 
         response = CompletionResponse(
             id=ret[0]["meta_info"]["id"],
@@ -845,7 +845,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     prompt_cached_tokens = sum(
                         tokens for tokens in cached_tokens.values()
                     )
-                    cache_report = orchestrator.server_args.enable_cache_report
+                    cache_report = tokenizer_manager.server_args.enable_cache_report
 
                     usage = UsageInfo(
                         prompt_tokens=total_prompt_tokens,
@@ -1459,7 +1459,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     prompt_cached_tokens = sum(
                         tokens for tokens in cached_tokens.values()
                     )
-                    cache_report = orchestrator.server_args.enable_cache_report
+                    cache_report = tokenizer_manager.server_args.enable_cache_report
                     usage = UsageInfo(
                         prompt_tokens=total_prompt_tokens,
                         completion_tokens=total_completion_tokens,
