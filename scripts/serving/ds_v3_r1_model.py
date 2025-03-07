@@ -25,13 +25,13 @@ STREAM_DELIMITER = b"\n\n"
 DEFAULT_GPU_UTILIZATION = 0.88
 
 DEFAULT_MAX_OUTPUT_LENGTH = 2048
-SUPPORTED_MAX_OUTPUT_LENGTH = 4096
+SUPPORTED_MAX_OUTPUT_LENGTH = 8192
 DEFAULT_BEAM_WIDTH = 1
 DEFAULT_TEMPERATURE = 0.4
 DEFAULT_TOP_K = 20
 DEFAULT_TOP_P = 0.95
 DEFAULT_DO_SAMPLE = False
-STREAM_TIMEOUT_SECONDS = 400
+STREAM_TIMEOUT_SECONDS = 360
 TOKENIZER_TIMEOUT_SECONDS = 5
 
 ENTRY_POINT_KEY = "__entry_point__"
@@ -310,6 +310,11 @@ class OpenAIEntrypointRequestHandler:
 
         stream = payload.get('stream', True)
         payload['stream'] = stream
+
+        max_tokens = payload.get('max_tokens', SUPPORTED_MAX_OUTPUT_LENGTH)
+        max_tokens = max_tokens if max_tokens else SUPPORTED_MAX_OUTPUT_LENGTH
+        payload['max_tokens'] = min(max_tokens, SUPPORTED_MAX_OUTPUT_LENGTH)
+
 
         if not payload.get('model', None):
             payload['model'] = 'auto'
