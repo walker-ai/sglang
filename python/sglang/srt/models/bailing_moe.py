@@ -467,5 +467,7 @@ class BailingMoEForCausalLM(nn.Module):
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight)
 
+class BailingMoeForCausalLM(BailingMoEForCausalLM):
+    pass
 
-EntryClass = [BailingMoEForCausalLM]
+EntryClass = [BailingMoEForCausalLM, BailingMoeForCausalLM]
