@@ -53,7 +53,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import make_layers
+from sglang.srt.utils import add_prefix, make_layers
 
 LoraConfig = None
 
@@ -72,7 +72,7 @@ class GLMMLP_V2(nn.Module):
             config.hidden_size, [intermediate_size] * 2,
             bias=config.use_bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.gate_up_proj",
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -80,7 +80,7 @@ class GLMMLP_V2(nn.Module):
             bias=config.use_bias,
             reduce_results=reduce_results,
             quant_config=quant_config,
-            prefix=f"{prefix}.down_proj",
+            prefix=add_prefix("down_proj", prefix),
         )
 
         if not config.use_swiglu:
@@ -117,7 +117,7 @@ class GLMMoE_V2(nn.Module):
             self.num_experts,
             bias=False,
             quant_config=None,
-            prefix=f"{prefix}.gate",
+            prefix=add_prefix("gate", prefix),
         )
 
         MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
@@ -129,7 +129,7 @@ class GLMMoE_V2(nn.Module):
             renormalize=self.norm_expert_prob,
             quant_config=quant_config,
             tp_size=self.tp_size,
-            prefix=f"{prefix}.experts"
+            prefix=add_prefix("experts", prefix),
         )
 
         if self.num_shared_experts > 0:
@@ -140,7 +140,7 @@ class GLMMoE_V2(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 reduce_results=False,
-                prefix=f"{prefix}.shared_experts"
+                prefix=add_prefix("shared_experts", prefix),
             )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -209,7 +209,7 @@ class GLMAttention(nn.Module):
             self.total_kv_heads,
             bias=(config.use_bias or config.use_qkv_bias),
             quant_config=quant_config,
-            prefix=f"{prefix}.query_key_value",
+            prefix=add_prefix("query_key_value", prefix),
         )
 
         self.dense = RowParallelLinear(
@@ -217,7 +217,7 @@ class GLMAttention(nn.Module):
             self.hidden_size,
             bias=config.use_bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.dense",
+            prefix=add_prefix("dense", prefix),
         )
 
         if not self.use_rotary or self.rotary_type != 'full-1d':
@@ -274,7 +274,7 @@ class GLMBlock(nn.Module):
             config,
             layer_id,
             quant_config,
-            prefix=f"{prefix}.attention",
+            prefix=add_prefix("attention", prefix),
         )
 
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
@@ -285,7 +285,7 @@ class GLMBlock(nn.Module):
             if not (config.mlp_version == "v2" or config.gate_up):
                 raise ValueError("Unsupported GLM MLP_V1 Model for bailing.")
             mlp_class = GLMMLP_V2
-        self.mlp = mlp_class(intermediate_size, config, quant_config, prefix=f"{prefix}.mlp")
+        self.mlp = mlp_class(intermediate_size, config, quant_config, prefix=add_prefix("mlp", prefix),)
 
     def forward(
         self,
@@ -345,7 +345,7 @@ class GLMModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix
             ),
-            prefix=f"{prefix}.layers"
+            prefix=add_prefix("layers", prefix),
         )
 
         assert config.use_rmsnorm
@@ -386,7 +386,7 @@ class GLMForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.transformer = GLMModel(config, quant_config, prefix="transformer")
+        self.transformer = GLMModel(config, quant_config, prefix=add_prefix("transformer", ""),)
         self.lm_head = self.transformer.lm_head
         self.logits_processor = LogitsProcessor(config)
 
