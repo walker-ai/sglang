@@ -31,7 +31,7 @@ from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
 
-from sglang.srt.configs.glm import GLMConfig
+from sglang.srt.configs.bailing_moe_config import BailingMoEConfig
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -58,11 +58,11 @@ from sglang.srt.utils import add_prefix, make_layers
 LoraConfig = None
 
 
-class GLMMLP_V2(nn.Module):
+class BailingMoEMLP(nn.Module):
     def __init__(
         self,
         intermediate_size: int,
-        config: GLMConfig,
+        config: BailingMoEConfig,
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: Optional[bool] = True,
         prefix: str = "",
@@ -83,7 +83,7 @@ class GLMMLP_V2(nn.Module):
             prefix=add_prefix("down_proj", prefix),
         )
 
-        if not config.use_swiglu:
+        if config.hidden_act != "silu":
             raise ValueError("Unsupported activation. Only silu is supported for now.")
         self.act_fn = SiluAndMul()
 
@@ -94,21 +94,19 @@ class GLMMLP_V2(nn.Module):
         return hidden_states
 
 
-class GLMMoE_V2(nn.Module):
+class BailingMoE(nn.Module):
     def __init__(
         self,
-        intermediate_size: int,
-        config: GLMConfig,
+        config: BailingMoEConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        reduce_results: Optional[bool] = True,
         prefix: str = "",
     ) -> None:
         super().__init__()
 
         self.tp_size = get_tensor_model_parallel_world_size()
         self.num_experts = config.num_experts
-        self.top_k = config.top_k
-        self.norm_expert_prob = config.norm_expert_prob
+        self.top_k = config.num_experts_per_tok
+        self.norm_topk_prob = config.norm_topk_prob
         self.hidden_size = config.hidden_size
         self.num_shared_experts = config.num_shared_experts
         # Gate always runs at half / full precision for now.
@@ -125,17 +123,17 @@ class GLMMoE_V2(nn.Module):
             num_experts=self.num_experts,
             top_k=self.top_k,
             hidden_size=self.hidden_size,
-            intermediate_size=config.expert_intermediate_size,
-            renormalize=self.norm_expert_prob,
+            intermediate_size=config.moe_intermediate_size,
+            renormalize=self.norm_topk_prob,
             quant_config=quant_config,
             tp_size=self.tp_size,
             prefix=add_prefix("experts", prefix),
         )
 
         if self.num_shared_experts > 0:
-            intermediate_size = (config.expert_intermediate_size *
+            intermediate_size = (config.moe_intermediate_size *
                                  self.num_shared_experts)
-            self.shared_experts = GLMMLP_V2(
+            self.shared_experts = BailingMoEMLP(
                 intermediate_size=intermediate_size,
                 config=config,
                 quant_config=quant_config,
@@ -163,10 +161,10 @@ class GLMMoE_V2(nn.Module):
         return final_hidden_states.view(num_tokens, hidden_size)
 
 
-class GLMAttention(nn.Module):
+class BailingMoEAttention(nn.Module):
     def __init__(
         self,
-        config: GLMConfig,
+        config: BailingMoEConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -174,8 +172,6 @@ class GLMAttention(nn.Module):
         super().__init__()
         # hidden_states大小
         self.hidden_size = config.hidden_size
-        self.use_rotary = config.use_rotary
-        self.rotary_type = config.rotary_type
         # q头数
         self.total_num_heads = config.num_attention_heads
         # kv头数（mha下跟total_num_heads相等，mqa或gqa小于total_num_heads）
@@ -220,9 +216,6 @@ class GLMAttention(nn.Module):
             prefix=add_prefix("dense", prefix),
         )
 
-        if not self.use_rotary or self.rotary_type != 'full-1d':
-            raise ValueError("Unsupported model arch. Only full-1d rope is supported for now.")
-
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
@@ -253,10 +246,10 @@ class GLMAttention(nn.Module):
         return attn_output
 
 
-class GLMBlock(nn.Module):
+class BailingMoEBlock(nn.Module):
     def __init__(
         self,
-        config: GLMConfig,
+        config: BailingMoEConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -264,28 +257,15 @@ class GLMBlock(nn.Module):
         super().__init__()
         hidden_size = config.hidden_size
 
-        intermediate_size = config.intermediate_size if config.intermediate_size \
-            else (4 * hidden_size)
-
-        assert config.use_rmsnorm, "DO NOT support nn.LayerNorm for bailing in SGLang"
         self.input_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
-
-        self.attention = GLMAttention(
+        self.attention = BailingMoEAttention(
             config,
             layer_id,
             quant_config,
             prefix=add_prefix("attention", prefix),
         )
-
+        self.mlp = BailingMoE(config, quant_config, prefix=add_prefix("mlp", prefix),)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
-
-        if config.moe_config and config.num_experts > 0:
-            mlp_class = GLMMoE_V2
-        else:
-            if not (config.mlp_version == "v2" or config.gate_up):
-                raise ValueError("Unsupported GLM MLP_V1 Model for bailing.")
-            mlp_class = GLMMLP_V2
-        self.mlp = mlp_class(intermediate_size, config, quant_config, prefix=add_prefix("mlp", prefix),)
 
     def forward(
         self,
@@ -313,11 +293,11 @@ class GLMBlock(nn.Module):
         return hidden_states, residual
 
 
-class GLMModel(nn.Module):
+class BailingMoEModel(nn.Module):
 
     def __init__(
         self,
-        config: GLMConfig,
+        config: BailingMoEConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = ""
     ):
@@ -329,17 +309,18 @@ class GLMModel(nn.Module):
             self.vocab_size,
             self.embed_dim,
             quant_config=quant_config,
+            prefix=add_prefix("word_embeddings", prefix),
         )
 
         # tie_word_embeddings为true，复用tie_word_embeddings，反之是独立的
         self.lm_head = self.word_embeddings if config.tie_word_embeddings \
             else ParallelLMHead(self.vocab_size, self.embed_dim, quant_config=quant_config, prefix=add_prefix("lm_head", prefix),)
 
-        self.embedding_dropout = torch.nn.Dropout(config.embedding_dropout_prob)
+        self.embedding_dropout = torch.nn.Dropout(config.embedding_dropout)
 
         self.layers = make_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: GLMBlock(
+            lambda idx, prefix: BailingMoEBlock(
                 layer_id=idx,
                 config=config,
                 quant_config=quant_config,
@@ -348,8 +329,7 @@ class GLMModel(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
 
-        assert config.use_rmsnorm
-        self.final_layernorm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -373,21 +353,21 @@ class GLMModel(nn.Module):
                 residual,
             )
 
-        hidden_states, _ = self.final_layernorm(hidden_states, residual)
+        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
-class GLMForCausalLM(nn.Module):
+class BailingMoEForCausalLM(nn.Module):
     def __init__(
         self,
-        config: GLMConfig,
+        config: BailingMoEConfig,
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.transformer = GLMModel(config, quant_config, prefix=add_prefix("transformer", ""),)
-        self.lm_head = self.transformer.lm_head
+        self.model = BailingMoEModel(config, quant_config, prefix=add_prefix("model", ""),)
+        self.lm_head = self.model.lm_head
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
@@ -398,7 +378,7 @@ class GLMForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        hidden_states = self.transformer(input_ids, positions, forward_batch, input_embeds)
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
@@ -432,15 +412,9 @@ class GLMForCausalLM(nn.Module):
                 import torch.nn.functional as F
                 loaded_weight = F.normalize(loaded_weight, dim=0, p=2, eps=1e-7)
 
-            # key对齐，默认以 transformer. 开头
-            name = name[len('glm.'):] if name.startswith('glm.') else name
-            name = name[len('transformer.'):] if name.startswith('transformer.transformer.') else name
-            if not name.startswith('transformer.'):
-                name = 'transformer.' + name
-            # moe router/gate改名
-            name = name.replace('.router.classifier.', '.gate.')
-            # moe v2改名
-            name = name.replace('.expert_', '.')
+            # key对齐，默认以 model. 开头，主要是lm_head
+            if not name.startswith('model.'):
+                name = 'model.' + name
 
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
@@ -494,8 +468,4 @@ class GLMForCausalLM(nn.Module):
                     weight_loader(param, loaded_weight)
 
 
-class GLMForConditionalGeneration(GLMForCausalLM):
-    pass
-
-
-EntryClass = [GLMForCausalLM, GLMForConditionalGeneration]
+EntryClass = [BailingMoEForCausalLM]
