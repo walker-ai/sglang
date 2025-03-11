@@ -329,6 +329,7 @@ class GLMModel(nn.Module):
             self.vocab_size,
             self.embed_dim,
             quant_config=quant_config,
+            prefix=add_prefix("word_embeddings", prefix),
         )
 
         # tie_word_embeddings为true，复用tie_word_embeddings，反之是独立的
