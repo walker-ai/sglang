@@ -847,7 +847,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     )
 
                     final_usage_chunk = CompletionStreamResponse(
-                        id=(trace_id or str(uuid.uuid4().hex)),
+                        id=(trace_id or content["meta_info"]["id"]),
                         object=chunk_object_type,
                         created=int(time.time()),
                         choices=[],
@@ -855,7 +855,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                         usage=usage,
                     )
                     final_usage_data = final_usage_chunk.model_dump_json(
-                        exclude_unset=True, exclude_none=True
+                        exclude_none=True
                     )
                     yield f"data: {final_usage_data}\n\n"
             except ValueError as e:
@@ -1177,7 +1177,7 @@ def v1_chat_generate_response(
                     "tool_calls": tool_calls,
                     "reasoning_content": reasoning_text,
                 },
-                "logprobs": choice_logprobs,
+                "logprobs": choice_logprobs.model_dump() if choice_logprobs else None,
                 "finish_reason": (finish_reason["type"] if finish_reason else ""),
                 "matched_stop": (
                     finish_reason["matched"]
@@ -1544,7 +1544,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                     )
 
                     final_usage_chunk = ChatCompletionStreamResponse(
-                        id=(trace_id or str(uuid.uuid4().hex)),
+                        id=(trace_id or content["meta_info"]["id"]),
                         object=chunk_object_type,
                         created=int(time.time()),
                         choices=[],
@@ -1552,7 +1552,7 @@ async def v1_chat_completions(tokenizer_manager, raw_request: Request):
                         usage=usage,
                     )
                     final_usage_data = final_usage_chunk.model_dump_json(
-                        exclude_unset=True, exclude_none=True
+                        exclude_none=True
                     )
                     yield f"data: {final_usage_data}\n\n"
             except ValueError as e:
