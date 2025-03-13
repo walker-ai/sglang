@@ -774,7 +774,7 @@ class TokenizerManager:
                 max_length = 1 << 30
                 skip_names = set(
                     [
-                        "text",
+                        # "text",
                         "input_ids",
                         "input_embeds",
                         "image_data",
