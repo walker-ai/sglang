@@ -767,6 +767,16 @@ class NewLineFormatter(logging.Formatter):
 
 
 def configure_logger(server_args, prefix: str = ""):
+    if SGLANG_LOGGING_CONFIG_PATH := os.getenv("SGLANG_LOGGING_CONFIG_PATH"):
+        if not os.path.exists(SGLANG_LOGGING_CONFIG_PATH):
+            raise Exception(
+                "Setting SGLANG_LOGGING_CONFIG_PATH from env with "
+                f"{SGLANG_LOGGING_CONFIG_PATH} but it does not exist!"
+            )
+        with open(SGLANG_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
+            custom_config = json.loads(file.read())
+        logging.config.dictConfig(custom_config)
+        return
     import concurrent_log_handler  # noqa: F401
     _FORMAT = f"%(asctime)s %(levelname)s %(process)d [%(filename)s:%(lineno)d] %(message)s"
     _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
