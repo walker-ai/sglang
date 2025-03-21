@@ -371,7 +371,7 @@ class OpenAIEntrypointRequestHandler:
                     choices = result_obj.get("choices", [])
                     # deepseek r1的返回bugfix
                     if choices:
-                        content = choices[0]["delta"].get("content", "")
+                        content = choices[0]["delta"].get("content", "") or ""
                         if not content.startswith("<think>"):
                             choices[0]["delta"]["content"] = f"<think>\n{assistant_prefix}{content}"
                     chunk = json.dumps(result_obj, ensure_ascii=False)
@@ -683,7 +683,7 @@ class LegacyEntrypointRequestHandler(OpenAIEntrypointRequestHandler):
                 if choices:
                     choice = choices[0]
                     finish_reason = choice.get('finish_reason')
-                    content = choice.get('delta').get('content', '')
+                    content = choice.get('delta').get('content', '') or ''
 
                 if is_first_token and not content.startswith("<think>"):
                     content = f"<think>\n{content}"
