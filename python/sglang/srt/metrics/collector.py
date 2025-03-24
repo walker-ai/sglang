@@ -256,7 +256,7 @@ class TokenizerMetricsCollector:
     ):
         self.prompt_tokens_total.labels(**self.labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**self.labels).inc(generation_tokens)
-        self.cached_tokens_total.labels(**self.labels).inc(cached_tokens)
+        self.cached_tokens_total.labels(**self.labels).inc(max(cached_tokens, 0))
         self.num_requests_total.labels(**self.labels).inc(1)
         self._log_histogram(self.histogram_e2e_request_latency, e2e_latency)
         if generation_tokens >= 1:
