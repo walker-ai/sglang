@@ -643,7 +643,7 @@ class LegacyEntrypointRequestHandler(OpenAIEntrypointRequestHandler):
                 if choices:
                     choice = choices[0]
                     finish_reason = choice.get('finish_reason')
-                    content = choice.get('delta').get('content')
+                    content = choice.get('delta').get('content', '')
 
                 res = {
                     "result": content or "",
@@ -772,7 +772,7 @@ class LegacyEntrypointRequestHandler(OpenAIEntrypointRequestHandler):
                 content = ''
                 if choices:
                     choice = choices[0]
-                    content = choice.get('text')
+                    content = choice.get('text', '')
                     finish_reason = choice.get('finish_reason')
 
                 # 兼容现有格式
