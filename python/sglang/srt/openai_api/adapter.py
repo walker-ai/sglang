@@ -1222,7 +1222,7 @@ def v1_chat_generate_response(
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": text if text else None,
+                    "content": text or "",
                     "tool_calls": tool_calls,
                     "reasoning_content": reasoning_text if reasoning_text else None,
                 },
@@ -1239,7 +1239,7 @@ def v1_chat_generate_response(
                 index=idx,
                 message=ChatMessage(
                     role="assistant",
-                    content=text if text else None,
+                    content=(text or ""),
                     tool_calls=tool_calls,
                     reasoning_content=reasoning_text if reasoning_text else None,
                 ),
@@ -1404,7 +1404,7 @@ async def v1_chat_completions(
                                 role="assistant", reasoning_content=None
                             )
                         else:
-                            delta = DeltaMessage(role="assistant", content=None)
+                            delta = DeltaMessage(role="assistant", content="")
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=delta,
@@ -1488,7 +1488,7 @@ async def v1_chat_completions(
                             choice_data = ChatCompletionResponseStreamChoice(
                                 index=index,
                                 delta=DeltaMessage(
-                                    content=normal_text if normal_text else None
+                                    content=(normal_text or "")
                                 ),
                                 finish_reason=(
                                     None
@@ -1563,7 +1563,7 @@ async def v1_chat_completions(
                         # No tool calls => just treat this as normal text
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
-                            delta=DeltaMessage(role="assistant", content=delta if delta else None),
+                            delta=DeltaMessage(role="assistant", content=(delta or "")),
                             finish_reason=(
                                 None
                                 if finish_reason_type and len(finish_reason_type) == 0
