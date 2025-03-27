@@ -1607,17 +1607,11 @@ async def v1_chat_completions(
                     id=(trace_id or content["meta_info"]["id"]),
                     object=chunk_object_type,
                     created=created,
-                    choices=[
-                        ChatCompletionResponseStreamChoice(
-                            index=index,
-                            delta=DeltaMessage(),
-                            finish_reason=finish_reason_type,
-                        )
-                    ],
+                    choices=[],
                     model=request.model,
                     usage=usage,
                 )
-                yield f"data: {final_usage_chunk.model_dump_json()}\n\n"
+                yield f"data: {final_usage_chunk.model_dump_json(exclude_none=True)}\n\n"
             except ValueError as e:
                 error = create_streaming_error_response(str(e))
                 yield f"data: {error}\n\n"
