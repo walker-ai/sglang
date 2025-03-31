@@ -77,7 +77,8 @@ from sglang.utils import convert_json_schema_to_str, get_exception_traceback
 logger = logging.getLogger(__name__)
 
 chat_template_name = None
-
+SOFA_TRACE_IN_HEADER = "sofa-traceid"
+SOFA_TRACE_IN_BODY = "trace_id"
 
 class FileMetadata:
     def __init__(self, filename: str, purpose: str):
@@ -718,7 +719,7 @@ def v1_generate_response(
 async def v1_completions(tokenizer_manager, raw_request: Request):
     request_json = await raw_request.json()
     # 外部传入trace_id
-    trace_id = get_trace_id(request_json)
+    trace_id = get_trace_id(request_json, raw_request.headers)
     request_ids = [trace_id] if trace_id else None
 
     all_requests = [CompletionRequest(**request_json)]
@@ -1313,7 +1314,7 @@ async def v1_chat_completions(
 ):
     request_json = await raw_request.json()
     # 外部传入trace_id
-    trace_id = get_trace_id(request_json)
+    trace_id = get_trace_id(request_json, raw_request.headers)
     request_ids = [trace_id] if trace_id else None
 
     all_requests = [ChatCompletionRequest(**request_json)]
@@ -1753,11 +1754,13 @@ async def v1_embeddings(tokenizer_manager, raw_request: Request):
 
     return response
 
-def get_trace_id(req_json):
-    trace_id = req_json.pop("trace_id", None)
-    if not trace_id:
-        return None
-    return trace_id + '_' + str(uuid.uuid4().hex)[:8]
+def get_trace_id(req_json, headers=None):
+    # 优先取header中的，然后再body里取
+    if headers:
+        trace_id = headers.get(SOFA_TRACE_IN_HEADER, None)
+    if not trace_id and req_json:
+        trace_id = req_json.pop(SOFA_TRACE_IN_BODY, None)
+    return (trace_id + '_' + str(uuid.uuid4().hex)[:8]) if trace_id else None
 
 def to_openai_style_logprobs(
     input_token_logprobs=None,
