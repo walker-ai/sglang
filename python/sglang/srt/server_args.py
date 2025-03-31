@@ -104,6 +104,7 @@ class ServerArgs:
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
+    reasoning_padding: Optional[str] = None
 
     # Data parallelism
     dp_size: int = 1
@@ -727,6 +728,12 @@ class ServerArgs:
             choices=list(ReasoningParser.DetectorMap.keys()),
             default=ServerArgs.reasoning_parser,
             help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
+        )
+        parser.add_argument(
+            "--reasoning-padding",
+            type=str,
+            default=ServerArgs.reasoning_padding,
+            help="Output padding for reasoning models before generation, e.g. '<think>\n' ",
         )
 
         # Data parallelism

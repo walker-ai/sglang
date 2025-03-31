@@ -1118,6 +1118,7 @@ def v1_chat_generate_response(
     cache_report=False,
     tool_call_parser=None,
     reasoning_parser=None,
+    reasoning_padding=None,
 ):
     choices = []
 
@@ -1169,6 +1170,9 @@ def v1_chat_generate_response(
 
         tool_calls = None
         text = ret_item["text"]
+
+        if reasoning_padding and text is not None:
+            text = f"{reasoning_padding}{text}"
 
         if isinstance(request, list):
             tool_choice = request[idx].tool_choice
@@ -1398,7 +1402,7 @@ async def v1_chat_completions(
                     if is_first:
                         # First chunk with role
                         is_first = False
-                        delta = DeltaMessage(role="assistant", content="")
+                        delta = DeltaMessage(role="assistant", content=(tokenizer_manager.server_args.reasoning_padding or ""))
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
                             delta=delta,
@@ -1642,6 +1646,7 @@ async def v1_chat_completions(
         cache_report=tokenizer_manager.server_args.enable_cache_report,
         tool_call_parser=tokenizer_manager.server_args.tool_call_parser,
         reasoning_parser=tokenizer_manager.server_args.reasoning_parser,
+        reasoning_padding=tokenizer_manager.server_args.reasoning_padding,
     )
 
     return response
