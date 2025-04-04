@@ -76,10 +76,13 @@ global_server_args_dict = {
     "device": ServerArgs.device,
     "speculative_accept_threshold_single": ServerArgs.speculative_accept_threshold_single,
     "speculative_accept_threshold_acc": ServerArgs.speculative_accept_threshold_acc,
+    "enable_flashinfer_mla": ServerArgs.enable_flashinfer_mla,
     "enable_flashmla": ServerArgs.enable_flashmla,
     "disable_radix_cache": ServerArgs.disable_radix_cache,
     "flashinfer_mla_disable_ragged": ServerArgs.flashinfer_mla_disable_ragged,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
+    "n_share_experts_fusion": ServerArgs.n_share_experts_fusion,
+    "disable_shared_experts_fusion": ServerArgs.disable_shared_experts_fusion,
 }
 
 logger = logging.getLogger(__name__)
@@ -1434,7 +1437,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Create seq_lens_cpu when needed
         if (
-            global_server_args_dict["attention_backend"] == "flashinfer_mla"
+            global_server_args_dict["enable_flashinfer_mla"]
             or global_server_args_dict["enable_flashmla"]
             or global_server_args_dict["attention_backend"] == "fa3"
         ):
