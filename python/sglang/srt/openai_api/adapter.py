@@ -1630,7 +1630,18 @@ async def v1_chat_completions(
                     id=(trace_id or content["meta_info"]["id"]),
                     object=chunk_object_type,
                     created=created,
-                    choices=[],
+                    choices=[
+                        ChatCompletionResponseStreamChoice(
+                            index=index,
+                            delta=DeltaMessage(role="assistant", content=""),
+                            finish_reason=finish_reason_type,
+                            matched_stop=(
+                                finish_reason["matched"]
+                                if finish_reason and "matched" in finish_reason
+                                else None
+                            ),
+                        )
+                    ],
                     model=request.model,
                     usage=usage,
                 )
