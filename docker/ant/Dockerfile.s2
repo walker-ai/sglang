@@ -1,0 +1,51 @@
+FROM reg.docker.alibaba-inc.com/aii/aistudio:8900124-20250307163740
+
+# 安装cuda12.4, 如果基础镜像有就可以不用。
+RUN curl http://dmsint.cn-hangzhou.alipay.aliyun-inc.com/noao/yuhong.gyh/cuda/cuda-12.4.tar | tar -xvf - -C /usr/local
+RUN rm -rf /usr/local/cuda
+RUN pushd /usr/local/ && ln -s cuda-12.4 cuda && popd
+# 让/usr/local/cuda/compat作为软连接，可以被handle_cuda_compat.py删除掉。一般来说A卡需要compat，L卡和H卡不需要。
+RUN pushd /usr/local/cuda/ && mv compat compat_backup && ln -s compat_backup compat && popd
+RUN sed -i 's/base64\.encodestring/base64\.encodebytes/g' /opt/conda/lib/python3.10/site-packages/osscmd/oss_util.py
+
+# 新默认版本会有编译失败
+RUN pip install tokenizers==0.20.3
+
+RUN pip uninstall -y torch torchvision torchaudio
+RUN pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 xformers==0.0.28.post3
+RUN pip install toml pytest setuptools_scm outlines_core openai==1.58.1
+RUN echo "ant_vllm_073_dev: 4754911acfa9529bcbc12a2d4914f0bf512129d7 https://aci.alipay.com/project/119800126/pipeline/443011885?tenant_path=alipay&jobId=1277674102" > /home/admin/version.log
+RUN pip install "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJ8c8337c713344a97add133d7f7156cfe/2025-04-01-11-29-43/vllm/vllm-0.7.3.post1.dev5%2Bg4754911ac.cu124.ant-cp310-cp310-linux_x86_64.whl?Expires=1746098985&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=ciylImUMHLKPBaqy2JtdDycmN88%3D"
+# RUN pip install markupsafe>=2.0.1
+# RUN pip install pydantic==2.4.2
+RUN pip install --upgrade jinja2>=3.0
+RUN find /usr -name libarchive.so.13 || echo "OK"
+RUN yum install -y libarchive
+RUN find /usr -name libarchive.so.13
+RUN yum install -y gcc glibc-devel libcap-devel
+RUN pip install python-prctl
+RUN pip install "nvidia-cublas-cu12==12.4.5.8"
+RUN pip install "nvidia-nccl-cu12==2.24.3"
+
+RUN pip install decord && pip install torchao
+
+# FlashInfer安装
+RUN echo "flashinfer: v0.2.3 fdedc432 https://aci.alipay.com/project/157400076/pipeline/432310287?tenant_path=alipay&jobId=1245110054" > /home/admin/version.log
+RUN pip install "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJe55d5fdab2584c8b9309a527edb2daa4/2025-03-11-15-24-50/flashinfer/flashinfer_python-0.2.3-cp38-abi3-linux_x86_64.whl?Expires=1744298696&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=9U6tYZhZlfzaZBaLKCK06qjPKik%3D"
+
+# sglang和sgl_kernel安装
+RUN echo "sglang: main 94733ede https://aci.alipay.com/project/161500101/pipeline/442967396?tenant_path=alipay&jobId=1277454742" >> /home/admin/version.log
+RUN pip install "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJ65ab2b252a814d88aeb23a52c5880704/2025-04-01-10-05-12/sgl_kernel/sgl_kernel-0.0.5.post3-cp39-abi3-manylinux2014_x86_64.whl?Expires=1746093912&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=Ldrp9uvXWcfQbvYdwEwR5Vmn3l8%3D"
+RUN pip install "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJ65ab2b252a814d88aeb23a52c5880704/2025-04-01-10-05-11/sglang/sglang-0.4.4.post2-py3-none-any.whl?Expires=1746093912&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=QoC2%2BZdmsNhKVwGvjMGKMRNGWxw%3D"
+
+# 安装InfiniBand
+RUN rpmdb -vv --rebuilddb && yum install -y libnl3-devel
+RUN wget -q http://dmsint.cn-hangzhou.alipay.aliyun-inc.com/aistudio%2Fgpu%2Frdma-a100.tgz -O /tmp/rdma-a100.tgz
+RUN tar -xvf /tmp/rdma-a100.tgz -C /tmp
+RUN rpm -Uvh /tmp/rdma-a100/nic-libs-mellanox-rdma-5.2-2.x86_64.rpm
+RUN rm -rf /tmp/rdma-a100.tgz /tmp/rdma-a100/
+
+# 处理不同卡需要不同的compat的情况。
+RUN wget http://dmsint.cn-hangzhou.alipay.aliyun-inc.com/noao/vllm/handle_cuda_compat.py -O /home/admin/handle_cuda_compat.py
+RUN echo "/opt/conda/bin/python /home/admin/handle_cuda_compat.py" >> /etc/bashrc
+CMD ["/bin/bash"]
