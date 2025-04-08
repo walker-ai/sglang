@@ -34,9 +34,9 @@ RUN echo "flashinfer: v0.2.3 fdedc432 https://aci.alipay.com/project/157400076/p
 RUN pip install "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJe55d5fdab2584c8b9309a527edb2daa4/2025-03-11-15-24-50/flashinfer/flashinfer_python-0.2.3-cp38-abi3-linux_x86_64.whl?Expires=1744298696&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=9U6tYZhZlfzaZBaLKCK06qjPKik%3D"
 
 # sglang和sgl_kernel安装
-RUN echo "sglang: main 94733ede https://aci.alipay.com/project/161500101/pipeline/442967396?tenant_path=alipay&jobId=1277454742" >> /home/admin/version.log
-RUN pip install "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJ65ab2b252a814d88aeb23a52c5880704/2025-04-01-10-05-12/sgl_kernel/sgl_kernel-0.0.5.post3-cp39-abi3-manylinux2014_x86_64.whl?Expires=1746093912&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=Ldrp9uvXWcfQbvYdwEwR5Vmn3l8%3D"
-RUN pip install "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJ65ab2b252a814d88aeb23a52c5880704/2025-04-01-10-05-11/sglang/sglang-0.4.4.post2-py3-none-any.whl?Expires=1746093912&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=QoC2%2BZdmsNhKVwGvjMGKMRNGWxw%3D"
+RUN echo "Theta/SGLang: sgl_045_tags_sync 6436ae0d https://aci.alipay.com/project/161500101/pipeline/447227385?tenant_path=alipay&jobId=1286846880" >> /home/admin/version.log
+RUN pip install "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJc792f0936878462f99f8d812b41537dc/2025-04-07-12-34-30/sgl_kernel/sgl_kernel-0.0.8-cp39-abi3-linux_x86_64.whl?Expires=1746621271&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=5vz1FSoqS3K3yn5szgEnTORLlrc%3D"
+RUN pip install "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJc792f0936878462f99f8d812b41537dc/2025-04-07-12-34-30/sglang/sglang-0.4.5-py3-none-any.whl?Expires=1746621270&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=nRrqDrAQJvj48p4BfpR2nRkCONI%3D"
 
 # 安装InfiniBand
 RUN rpmdb -vv --rebuilddb && yum install -y libnl3-devel
