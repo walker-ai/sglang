@@ -220,6 +220,7 @@ def biased_grouped_topk(
     compiled: bool = True,
     n_share_experts_fusion: int = 0,
 ):
+    # TODO(yudian.zy): 是否要关掉compiled
     biased_grouped_topk_fn = (
         torch.compile(
             biased_grouped_topk_impl, dynamic=True, backend=get_compiler_backend()
