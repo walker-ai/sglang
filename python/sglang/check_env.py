@@ -21,6 +21,7 @@ PACKAGE_LIST = [
     "sglang",
     "sgl_kernel",
     "flashinfer",
+    "flashinfer-python",
     "triton",
     "transformers",
     "torchao",
