@@ -742,6 +742,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 and sum(forward_batch.extend_prefix_lens_cpu)
                 >= self.chunked_prefix_cache_threshold
             ):
+                # TODO(yudian.zy): 针对DP场景，判断最后的threshold是否跟attn-tp-size动态决策
                 return AttnForwardMethod.MHA_CHUNKED_KV
             else:
                 return AttnForwardMethod.MLA
@@ -1082,6 +1083,7 @@ class DeepseekV2AttentionMLA(nn.Module):
             v = kv[..., self.qk_nope_head_dim :]
             k_nope = kv[..., : self.qk_nope_head_dim]
 
+            # TODO(yudian.zy): 容易OOM，需要进一步调研优化
             k = torch.empty(
                 (
                     k_nope.shape[0],
