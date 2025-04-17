@@ -188,6 +188,7 @@ class ServerArgs:
     n_share_experts_fusion: int = 0
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
+    disable_fast_image_processor: bool = False
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -198,9 +199,6 @@ class ServerArgs:
     disaggregation_mode: str = "null"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
-
-    # multimodal
-    disable_fast_image_processor: bool = False
 
     def __post_init__(self):
         # Expert parallelism
@@ -1145,6 +1143,11 @@ class ServerArgs:
             action="store_true",
             help="Disable chunked prefix cache feature for deepseek, which should save overhead for short sequences.",
         )
+        parser.add_argument(
+            "--disable-fast-image-processor",
+            action="store_true",
+            help="Adopt base image processor instead of fast image processor.",
+        )
 
         # Server warmups
         parser.add_argument(
@@ -1194,13 +1197,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.disaggregation_transfer_backend,
             help="The backend for disaggregation transfer. Default is mooncake.",
-        )
-
-        # Multimodal
-        parser.add_argument(
-            "--disable-fast-image-processor",
-            action="store_true",
-            help="Adopt base image processor instead of fast image processor.",
         )
 
     @classmethod
