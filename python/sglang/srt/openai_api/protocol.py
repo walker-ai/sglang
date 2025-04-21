@@ -366,6 +366,10 @@ class ChatCompletionRequest(BaseModel):
 
     trace_id: Optional[str] = None
 
+    # For PD disaggregation
+    bootstrap_host: Optional[str] = None
+    bootstrap_room: Optional[int] = None
+
 
 class FunctionResponse(BaseModel):
     """Function response."""
