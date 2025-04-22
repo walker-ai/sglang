@@ -306,7 +306,6 @@ class OpenAIEntrypointRequestHandler:
         trace_id = payload.get('trace_id', 'none')
 
         # 在 trace_id 基础上增加随机数，防止同一个 trace 多次并行调用导致的 sglang 状态不一致
-        # TODO(yudian.zy) 当前sglang还不支持传入自定义的request id
         sglang_trace_id = trace_id + '_' + str(uuid.uuid1().hex)[:8]
         payload['trace_id'] = sglang_trace_id
 
