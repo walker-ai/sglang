@@ -55,7 +55,6 @@ import torch.distributed
 import torch.distributed as dist
 import triton
 import zmq
-from decord import VideoReader, cpu
 from fastapi.responses import ORJSONResponse
 from packaging import version as pkg_version
 from PIL import Image
@@ -79,10 +78,34 @@ time_infos = {}
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
+_warned_bool_env_var_keys = set()
+
 
 def get_bool_env_var(name: str, default: str = "false") -> bool:
     value = os.getenv(name, default)
-    return value.lower() in ("true", "1")
+    value = value.lower()
+
+    truthy_values = ("true", "1")
+    falsy_values = ("false", "0")
+
+    if (value not in truthy_values) and (value not in falsy_values):
+        if value not in _warned_bool_env_var_keys:
+            logger.warning(
+                f"get_bool_env_var({name}) see non-understandable value={value} and treat as false"
+            )
+        _warned_bool_env_var_keys.add(value)
+
+    return value in truthy_values
+
+
+def get_int_env_var(name: str, default: int = 0) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 # https://pytorch.org/docs/stable/notes/hip.html#checking-for-hip
@@ -129,10 +152,6 @@ def is_flashinfer_available():
     if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
         return False
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
-
-
-def is_cuda_available():
-    return is_cuda()
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -545,6 +564,9 @@ def load_audio(audio_file: str, sr: int = 16000, mono: bool = True) -> np.ndarra
 
 
 def encode_video(video_path, frame_count_limit=None):
+    # Lazy import because decord is not available on some arm platforms.
+    from decord import VideoReader, cpu
+
     if not os.path.exists(video_path):
         logger.error(f"Video {video_path} does not exist")
         return []
@@ -772,6 +794,8 @@ def add_api_key_middleware(app, api_key: str):
             return await call_next(request)
         if request.url.path.startswith("/health"):
             return await call_next(request)
+        if request.url.path.startswith("/metrics"):
+            return await call_next(request)
         if request.headers.get("Authorization") != "Bearer " + api_key:
             return ORJSONResponse(content={"error": "Unauthorized"}, status_code=401)
         return await call_next(request)
@@ -965,6 +989,8 @@ def get_zmq_socket(
         buf_size = -1
 
     socket = context.socket(socket_type)
+    if endpoint.find("[") != -1:
+        socket.setsockopt(zmq.IPV6, 1)
 
     def set_send_opt():
         socket.setsockopt(zmq.SNDHWM, 0)
@@ -1181,6 +1207,20 @@ def get_hpu_memory_capacity():
         )
 
 
+def get_device_memory_capacity(device: str = None):
+    if is_cuda():
+        gpu_mem = get_nvgpu_memory_capacity()
+    elif is_hip():
+        gpu_mem = get_amdgpu_memory_capacity()
+    elif device == "hpu":
+        gpu_mem = get_hpu_memory_capacity()
+    else:
+        # GPU memory is not known yet or no GPU is available.
+        gpu_mem = None
+
+    return gpu_mem
+
+
 # Copy from pytorch and OpenRLHF to allow creating multiple main groups.
 # https://github.com/pytorch/pytorch/blob/main/torch/distributed/distributed_c10d.py
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/utils/distributed_util.py
@@ -1265,7 +1305,10 @@ def print_warning_once(msg: str) -> None:
 
 def get_device_name(device_id: int = 0) -> str:
     if hasattr(torch, "cuda") and torch.cuda.is_available():
-        return torch.cuda.get_device_name(device_id)
+        device_name = torch.cuda.get_device_name(device_id)
+        # 蚂蚁的H200卡型号是L20X😂
+        device_name = device_name.replace('NVIDIA L20X', 'NVIDIA H200')
+        return device_name
 
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         return torch.xpu.get_device_name(device_id)
@@ -1967,6 +2010,8 @@ def is_page_size_one(server_args):
     return server_args.page_size == 1
 
 
+# TODO(hebiao064): Accelerate FA3 Spec Decode with topk > 1.
+# TODO(hebiao064): Improve the acc rate for FA3 Spec Decode with topk == 1 and page_size > 1.
 def is_no_spec_infer_or_topk_one(server_args):
     return server_args.speculative_eagle_topk is None or (
         server_args.speculative_eagle_topk is not None
@@ -1984,5 +2029,19 @@ def is_fa3_default_architecture(hf_config):
         "Llama4ForConditionalGeneration",
         "LlamaForCausalLM",
         "MistralForCausalLM",
+        "Gemma2ForCausalLM",
     }
     return architectures[0] in default_archs
+
+
+# Can be more general if it is used in multiple places (keep it simple and thus not general now)
+class BumpAllocator:
+    def __init__(self, buffer_size: int, dtype, device):
+        self._buffer = torch.zeros((buffer_size,), dtype=dtype, device=device)
+        self._pointer = 0
+
+    def allocate(self, size: int):
+        assert self._pointer + size <= len(self._buffer)
+        output = self._buffer[self._pointer : self._pointer + size]
+        self._pointer += size
+        return output

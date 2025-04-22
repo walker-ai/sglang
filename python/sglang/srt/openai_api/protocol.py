@@ -254,7 +254,7 @@ ChatCompletionMessageContentPart = Union[
 
 class ChatCompletionMessageGenericParam(BaseModel):
     role: Literal["system", "assistant", "tool"]
-    content: Union[str, List[ChatCompletionMessageContentTextPart]]
+    content: Union[str, List[ChatCompletionMessageContentTextPart], None]
 
 
 class ChatCompletionMessageUserParam(BaseModel):
@@ -357,6 +357,7 @@ class ChatCompletionRequest(BaseModel):
     stop_token_ids: Optional[List[int]] = None
     no_stop_trim: bool = False
     ignore_eos: bool = False
+    continue_final_message: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
     session_params: Optional[Dict] = None
@@ -364,6 +365,10 @@ class ChatCompletionRequest(BaseModel):
     stream_reasoning: bool = True
 
     trace_id: Optional[str] = None
+
+    # For PD disaggregation
+    bootstrap_host: Optional[str] = None
+    bootstrap_room: Optional[int] = None
 
 
 class FunctionResponse(BaseModel):
