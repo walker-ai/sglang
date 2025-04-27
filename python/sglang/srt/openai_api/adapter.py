@@ -717,7 +717,11 @@ def v1_generate_response(
 
 
 async def v1_completions(tokenizer_manager, raw_request: Request):
-    request_json = await raw_request.json()
+    try:
+        request_json = await raw_request.json()
+    except Exception as e:
+        return create_error_response("Invalid request body, error: ", str(e))
+
     # 外部传入trace_id
     trace_id = get_trace_id(request_json, raw_request.headers)
     request_ids = [trace_id] if trace_id else None
@@ -1395,7 +1399,11 @@ def v1_chat_generate_response(
 async def v1_chat_completions(
     tokenizer_manager, raw_request: Request, cache_report=False
 ):
-    request_json = await raw_request.json()
+    try:
+        request_json = await raw_request.json()
+    except Exception as e:
+        return create_error_response("Invalid request body, error: ", str(e))
+
     # 外部传入trace_id
     trace_id = get_trace_id(request_json, raw_request.headers)
     request_ids = [trace_id] if trace_id else None
@@ -1834,7 +1842,10 @@ def v1_embedding_response(ret, model_path, to_file=False):
 
 
 async def v1_embeddings(tokenizer_manager, raw_request: Request):
-    request_json = await raw_request.json()
+    try:
+        request_json = await raw_request.json()
+    except Exception as e:
+        return create_error_response("Invalid request body, error: ", str(e))
     all_requests = [EmbeddingRequest(**request_json)]
     adapted_request, request = v1_embedding_request(all_requests, tokenizer_manager)
 
