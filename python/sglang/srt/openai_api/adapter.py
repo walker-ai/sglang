@@ -557,7 +557,8 @@ def v1_generate_request(
         logprob_start_lens = logprob_start_lens[0]
         top_logprobs_nums = top_logprobs_nums[0]
         lora_paths = lora_paths[0]
-        request_ids = request_ids[0] if request_ids else None
+        if request_ids and len(request_ids) == 1:
+            request_ids = request_ids[0]
     else:
         if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
             prompt_kwargs = {"text": prompts}
@@ -717,10 +718,13 @@ def v1_generate_response(
 
 
 async def v1_completions(tokenizer_manager, raw_request: Request):
-    request_json = await raw_request.json()
+    try:
+        request_json = await raw_request.json()
+    except Exception as e:
+        return create_error_response("Invalid request body, error: ", str(e))
+
     # 外部传入trace_id
-    trace_id = get_trace_id(request_json, raw_request.headers)
-    request_ids = [trace_id] if trace_id else None
+    request_ids = get_trace_id(request_json, raw_request.headers)
 
     all_requests = [CompletionRequest(**request_json)]
     created = int(time.time())
@@ -859,7 +863,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     )
 
                     final_usage_chunk = CompletionStreamResponse(
-                        id=(trace_id or content["meta_info"]["id"]),
+                        id=(content["meta_info"]["id"]),
                         object=chunk_object_type,
                         created=created,
                         choices=[],
@@ -920,6 +924,7 @@ def v1_chat_generate_request(
 
     # NOTE: with openai API, the prompt's logprobs are always not computed
 
+    is_multimodal = tokenizer_manager.model_config.is_multimodal
     for request in all_requests:
         # Prep the data needed for the underlying GenerateReqInput:
         #  - prompt: The full prompt string.
@@ -929,6 +934,7 @@ def v1_chat_generate_request(
         #    None skips any image processing in GenerateReqInput.
         strict_tag = None
         prompt = ""
+        prompt_ids = []
         if not isinstance(request.messages, str):
             # Apply chat template and its stop strings.
             tools = None
@@ -975,8 +981,6 @@ def v1_chat_generate_request(
                             ),
                         }
                     )
-                    # TODO fix the compatible issues with xgrammar
-                    strict_tag = None
 
                 for message in request.messages:
                     if isinstance(message.content, str):
@@ -1030,7 +1034,7 @@ def v1_chat_generate_request(
                     ):
                         encoded = encoded[1:]
                     prompt_ids += encoded
-                if tokenizer_manager.model_config.is_multimodal:
+                if is_multimodal:
                     prompt = tokenizer_manager.tokenizer.decode(prompt_ids)
                 stop = request.stop
                 image_data = None
@@ -1075,8 +1079,9 @@ def v1_chat_generate_request(
                         stop.append(request.stop)
                     else:
                         stop.extend(request.stop)
-                prompt_ids = tokenizer_manager.tokenizer.encode(prompt)
 
+                if not is_multimodal:
+                    prompt_ids = tokenizer_manager.tokenizer.encode(prompt)
         else:
             # Use the raw prompt and stop strings if the messages is already a string.
             prompt_ids = request.messages
@@ -1146,7 +1151,7 @@ def v1_chat_generate_request(
         audio_data_list.append(audio_data)
         modalities_list.append(modalities)
     if len(all_requests) == 1:
-        if tokenizer_manager.model_config.is_multimodal:
+        if is_multimodal:
             # processor will need text input
             prompt_kwargs = {"text": prompts[0]}
         else:
@@ -1162,7 +1167,8 @@ def v1_chat_generate_request(
         top_logprobs_nums = top_logprobs_nums[0]
         modalities_list = modalities_list[0]
         lora_paths = lora_paths[0]
-        request_ids = request_ids[0] if request_ids else None
+        if request_ids and len(request_ids) == 1:
+            request_ids = request_ids[0]
     else:
         if tokenizer_manager.model_config.is_multimodal:
             # processor will need text input
@@ -1394,10 +1400,13 @@ def v1_chat_generate_response(
 async def v1_chat_completions(
     tokenizer_manager, raw_request: Request, cache_report=False
 ):
-    request_json = await raw_request.json()
+    try:
+        request_json = await raw_request.json()
+    except Exception as e:
+        return create_error_response("Invalid request body, error: ", str(e))
+
     # 外部传入trace_id
-    trace_id = get_trace_id(request_json, raw_request.headers)
-    request_ids = [trace_id] if trace_id else None
+    request_ids = get_trace_id(request_json, raw_request.headers)
 
     all_requests = [ChatCompletionRequest(**request_json)]
     created = int(time.time())
@@ -1697,7 +1706,7 @@ async def v1_chat_completions(
                 else:
                     usage = None
                 final_usage_chunk = ChatCompletionStreamResponse(
-                    id=(trace_id or content["meta_info"]["id"]),
+                    id=(content["meta_info"]["id"]),
                     object=chunk_object_type,
                     created=created,
                     choices=[
@@ -1833,7 +1842,10 @@ def v1_embedding_response(ret, model_path, to_file=False):
 
 
 async def v1_embeddings(tokenizer_manager, raw_request: Request):
-    request_json = await raw_request.json()
+    try:
+        request_json = await raw_request.json()
+    except Exception as e:
+        return create_error_response("Invalid request body, error: ", str(e))
     all_requests = [EmbeddingRequest(**request_json)]
     adapted_request, request = v1_embedding_request(all_requests, tokenizer_manager)
 
@@ -1853,11 +1865,16 @@ async def v1_embeddings(tokenizer_manager, raw_request: Request):
 
 def get_trace_id(req_json, headers=None):
     # 优先取header中的，然后再body里取
+    trace_id = None
     if headers:
         trace_id = headers.get(SOFA_TRACE_IN_HEADER, None)
     if not trace_id and req_json:
         trace_id = req_json.pop(SOFA_TRACE_IN_BODY, None)
-    return (trace_id + '_' + str(uuid.uuid4().hex)[:8]) if trace_id else None
+    parallel_num = req_json.get("n", 1)
+    if trace_id and parallel_num == 1:
+        # FIXME: 针对n>1的用法，先不生成trace_id
+        return [(trace_id + '_' + str(uuid.uuid4().hex)[:8]) for _ in range(parallel_num)]
+    return None
 
 def to_openai_style_logprobs(
     input_token_logprobs=None,
