@@ -1870,8 +1870,9 @@ def get_trace_id(req_json, headers=None):
         trace_id = headers.get(SOFA_TRACE_IN_HEADER, None)
     if not trace_id and req_json:
         trace_id = req_json.pop(SOFA_TRACE_IN_BODY, None)
-    if trace_id:
-        parallel_num = req_json.get("n", 1)
+    parallel_num = req_json.get("n", 1)
+    if trace_id and parallel_num == 1:
+        # FIXME: 针对n>1的用法，先不生成trace_id
         return [(trace_id + '_' + str(uuid.uuid4().hex)[:8]) for _ in range(parallel_num)]
     return None
 
