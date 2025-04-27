@@ -863,7 +863,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
                     )
 
                     final_usage_chunk = CompletionStreamResponse(
-                        id=(trace_id or content["meta_info"]["id"]),
+                        id=(content["meta_info"]["id"]),
                         object=chunk_object_type,
                         created=created,
                         choices=[],
@@ -1706,7 +1706,7 @@ async def v1_chat_completions(
                 else:
                     usage = None
                 final_usage_chunk = ChatCompletionStreamResponse(
-                    id=(trace_id or content["meta_info"]["id"]),
+                    id=(content["meta_info"]["id"]),
                     object=chunk_object_type,
                     created=created,
                     choices=[
