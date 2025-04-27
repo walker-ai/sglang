@@ -154,7 +154,7 @@ class ServerArgs:
     enable_nccl_nvls: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
-    enable_llama4_multimodal: Optional[bool] = None
+    enable_multimodal: Optional[bool] = None
     disable_overlap_schedule: bool = False
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
@@ -290,8 +290,6 @@ class ServerArgs:
         if self.grammar_backend is None:
             self.grammar_backend = "xgrammar"
 
-        self.enable_multimodal: Optional[bool] = self.enable_llama4_multimodal
-
         # Data parallelism attention
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
@@ -387,6 +385,18 @@ class ServerArgs:
         elif self.disaggregation_mode == "decode":
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
+
+        if self.enable_memory_saver:
+            try:
+                import torch_memory_saver
+            except ImportError:
+                logger.warning(
+                    "enable_memory_saver is enabled, but "
+                    "torch-memory-saver is not installed. Please install it "
+                    "via `pip3 uninstall torch-memory-saver`. "
+                    "For normal operation, it will be disabled."
+                )
+                raise
 
         os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = (
             "1" if self.enable_torch_compile else "0"
@@ -992,10 +1002,10 @@ class ServerArgs:
             help="Disable the custom all-reduce kernel and fall back to NCCL.",
         )
         parser.add_argument(
-            "--enable-llama4-multimodal",
-            default=ServerArgs.enable_llama4_multimodal,
+            "--enable-multimodal",
+            default=ServerArgs.enable_multimodal,
             action="store_true",
-            help="Enable the multimodal functionality for Llama-4.",
+            help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
         )
         parser.add_argument(
             "--disable-overlap-schedule",
@@ -1382,10 +1392,7 @@ def auto_choose_speculative_params(self: ServerArgs):
 
     You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
     """
-    if self.decrypted_config_file:
-        config_path = self.decrypted_config_file
-    else:
-        config_path = os.path.join(self.model_path, "config.json")
+    config_path = os.path.join(self.model_path, "config.json")
     if not os.path.exists(config_path):
         raise ValueError(f"{config_path} is not found.")
 
