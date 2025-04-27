@@ -557,7 +557,8 @@ def v1_generate_request(
         logprob_start_lens = logprob_start_lens[0]
         top_logprobs_nums = top_logprobs_nums[0]
         lora_paths = lora_paths[0]
-        request_ids = request_ids[0] if request_ids else None
+        if request_ids and len(request_ids) == 1:
+            request_ids = request_ids[0]
     else:
         if isinstance(prompts[0], str) or isinstance(prompts[0][0], str):
             prompt_kwargs = {"text": prompts}
@@ -723,8 +724,7 @@ async def v1_completions(tokenizer_manager, raw_request: Request):
         return create_error_response("Invalid request body, error: ", str(e))
 
     # 外部传入trace_id
-    trace_id = get_trace_id(request_json, raw_request.headers)
-    request_ids = [trace_id] if trace_id else None
+    request_ids = get_trace_id(request_json, raw_request.headers)
 
     all_requests = [CompletionRequest(**request_json)]
     created = int(time.time())
@@ -1167,7 +1167,8 @@ def v1_chat_generate_request(
         top_logprobs_nums = top_logprobs_nums[0]
         modalities_list = modalities_list[0]
         lora_paths = lora_paths[0]
-        request_ids = request_ids[0] if request_ids else None
+        if request_ids and len(request_ids) == 1:
+            request_ids = request_ids[0]
     else:
         if tokenizer_manager.model_config.is_multimodal:
             # processor will need text input
@@ -1405,8 +1406,7 @@ async def v1_chat_completions(
         return create_error_response("Invalid request body, error: ", str(e))
 
     # 外部传入trace_id
-    trace_id = get_trace_id(request_json, raw_request.headers)
-    request_ids = [trace_id] if trace_id else None
+    request_ids = get_trace_id(request_json, raw_request.headers)
 
     all_requests = [ChatCompletionRequest(**request_json)]
     created = int(time.time())
@@ -1865,11 +1865,15 @@ async def v1_embeddings(tokenizer_manager, raw_request: Request):
 
 def get_trace_id(req_json, headers=None):
     # 优先取header中的，然后再body里取
+    trace_id = None
     if headers:
         trace_id = headers.get(SOFA_TRACE_IN_HEADER, None)
     if not trace_id and req_json:
         trace_id = req_json.pop(SOFA_TRACE_IN_BODY, None)
-    return (trace_id + '_' + str(uuid.uuid4().hex)[:8]) if trace_id else None
+    if trace_id:
+        parallel_num = req_json.get("n", 1)
+        return [(trace_id + '_' + str(uuid.uuid4().hex)[:8]) for _ in range(parallel_num)]
+    return None
 
 def to_openai_style_logprobs(
     input_token_logprobs=None,
