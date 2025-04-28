@@ -12,8 +12,7 @@ pushd /usr/local/ && ln -s cuda-12.4 cuda && popd
 pushd /usr/local/cuda/ && mv compat compat_backup && ln -s compat_backup compat && popd
 sed -i 's/base64\.encodestring/base64\.encodebytes/g' /opt/conda/lib/python3.10/site-packages/osscmd/oss_util.py
 
-# 新默认版本会有编译失败
-pip install tokenizers==0.20.3
+pip install tokenizers==0.21.1
 
 # vllm版本比较低，依赖torch2.5.1所以，先装它然后再装torch
 echo "ant_vllm_073_dev: 4754911acfa9529bcbc12a2d4914f0bf512129d7 https://aci.alipay.com/project/119800126/pipeline/443011885?tenant_path=alipay&jobId=1277674102" > /home/admin/version.log
