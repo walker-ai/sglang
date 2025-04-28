@@ -363,6 +363,7 @@ class ChatCompletionRequest(BaseModel):
     session_params: Optional[Dict] = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
+    chat_template_kwargs: Optional[Dict] = None
 
     trace_id: Optional[str] = None
 
