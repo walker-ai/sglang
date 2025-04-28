@@ -1,0 +1,56 @@
+FROM reg.docker.alibaba-inc.com/aii/aistudio:8900124-20250307163740
+
+RUN tee /home/admin/docker_install.sh <<EOF
+
+set -e
+
+# 安装cuda12.4
+curl http://dmsint.cn-hangzhou.alipay.aliyun-inc.com/noao/yuhong.gyh/cuda/cuda-12.4.tar | tar -xvf - -C /usr/local
+rm -rf /usr/local/cuda
+pushd /usr/local/ && ln -s cuda-12.4 cuda && popd
+# 让/usr/local/cuda/compat作为软连接，可以被handle_cuda_compat.py删除掉。一般来说A卡需要compat，L卡和H卡不需要。
+pushd /usr/local/cuda/ && mv compat compat_backup && ln -s compat_backup compat && popd
+sed -i 's/base64\.encodestring/base64\.encodebytes/g' /opt/conda/lib/python3.10/site-packages/osscmd/oss_util.py
+
+pip install tokenizers==0.21.1
+
+# vllm版本比较低，依赖torch2.5.1所以，先装它然后再装torch
+echo "ant_vllm_073_dev: 4754911acfa9529bcbc12a2d4914f0bf512129d7 https://aci.alipay.com/project/119800126/pipeline/443011885?tenant_path=alipay&jobId=1277674102" > /home/admin/version.log
+pip install "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJ8c8337c713344a97add133d7f7156cfe/2025-04-01-11-29-43/vllm/vllm-0.7.3.post1.dev5%2Bg4754911ac.cu124.ant-cp310-cp310-linux_x86_64.whl?Expires=1746098985&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=ciylImUMHLKPBaqy2JtdDycmN88%3D"
+
+pip uninstall -y torch torchvision torchaudio
+pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 xformers==0.0.29.post2
+pip install toml pytest setuptools_scm outlines_core openai==1.58.1 
+pip install --upgrade jinja2>=3.0
+find /usr -name libarchive.so.13 || echo "OK"
+rpm --rebuilddb && yum install -y libarchive
+find /usr -name libarchive.so.13
+rpm --rebuilddb && yum install -y gcc glibc-devel libcap-devel
+pip install python-prctl
+
+pip install decord && pip install torchao
+
+# FlashInfer安装
+echo "flashinfer: v0.2.3 fdedc432 https://aci.alipay.com/project/157400076/pipeline/455673934?tenant_path=alipay&jobId=1311258994" > /home/admin/version.log
+pip install "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJe749fa4b13b346849a6ca95739491b47/2025-04-22-04-38-19/flashinfer/flashinfer_python-0.2.3-cp38-abi3-linux_x86_64.whl?Expires=1747888705&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=6oQmt4jLull6fEOE8COcK5igvS4%3D"
+
+# sglang和sgl_kernel安装
+echo "sglang: main b5be5694 https://aci.alipay.com/project/157200061/pipeline/457435259?tenant_path=alipay&jobId=1317863712" >> /home/admin/version.log
+pip install "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJa478676e18af400187a73da3d25cb678/2025-04-25-02-20-42/sgl_kernel/sgl_kernel-0.1.0-cp39-abi3-linux_x86_64.whl?Expires=1748139643&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=G1pMNV35i8JXBUzvLJYhSR8UO%2Bk%3D"
+pip install "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJa478676e18af400187a73da3d25cb678/2025-04-25-02-20-41/sglang/sglang-0.4.5.post3-py3-none-any.whl?Expires=1748139642&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=4mI4sldg7FUmM4A9IGzpxQLIx2A%3D"
+
+# 安装InfiniBand
+rpmdb -vv --rebuilddb && yum install -y libnl3-devel
+wget -q http://dmsint.cn-hangzhou.alipay.aliyun-inc.com/aistudio%2Fgpu%2Frdma-a100.tgz -O /tmp/rdma-a100.tgz
+tar -xvf /tmp/rdma-a100.tgz -C /tmp
+rpm -Uvh /tmp/rdma-a100/nic-libs-mellanox-rdma-5.2-2.x86_64.rpm
+rm -rf /tmp/rdma-a100.tgz /tmp/rdma-a100/
+
+# 处理不同卡需要不同的compat的情况。
+wget http://dmsint.cn-hangzhou.alipay.aliyun-inc.com/noao/vllm/handle_cuda_compat.py -O /home/admin/handle_cuda_compat.py
+echo "/opt/conda/bin/python /home/admin/handle_cuda_compat.py" >> /etc/bashrc
+
+EOF
+
+RUN cat /home/admin/docker_install.sh && bash /home/admin/docker_install.sh
+CMD ["/bin/bash"]
