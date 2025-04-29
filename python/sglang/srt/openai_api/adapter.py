@@ -1111,7 +1111,7 @@ def v1_chat_generate_request(
 
         sampling_params = {
             "temperature": request.temperature,
-            "max_new_tokens": request.max_tokens,
+            "max_new_tokens": request.max_tokens or request.max_completion_tokens,
             "min_new_tokens": request.min_tokens,
             "stop": stop,
             "stop_token_ids": request.stop_token_ids,
@@ -1205,6 +1205,7 @@ def v1_chat_generate_request(
         modalities=modalities_list,
         lora_path=lora_paths,
         bootstrap_host=all_requests[0].bootstrap_host,
+        bootstrap_port=all_requests[0].bootstrap_port,
         bootstrap_room=all_requests[0].bootstrap_room,
     )
 
