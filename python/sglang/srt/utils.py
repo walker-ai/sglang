@@ -867,7 +867,7 @@ class NewLineFormatter(logging.Formatter):
 
 def configure_logger(server_args, prefix: str = ""):
     import concurrent_log_handler  # noqa: F401
-    _FORMAT = f"%(asctime)s %(levelname)s %(process)d [%(filename)s:%(lineno)d] %(message)s"
+    _FORMAT = f"%(asctime)s %(levelname)s %(process)d [{prefix} %(filename)s:%(lineno)d] %(message)s"
     _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
     DEFAULT_LOGGING_CONFIG = {
         "formatters": {
