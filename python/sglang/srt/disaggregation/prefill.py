@@ -29,6 +29,7 @@ import torch
 from sglang.srt.disaggregation.base import BaseKVManager, KVArgs, KVPoll
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    FakeBootstrapHost,
     KVClassType,
     ReqToMetadataIdxAllocator,
     TransferBackend,
@@ -116,7 +117,11 @@ class PrefillBootstrapQueue:
         return kv_manager
 
     def add(self, req: Req) -> None:
-        kv_sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
+        if req.bootstrap_host == FakeBootstrapHost:
+            # Fake transfer for warmup reqs
+            kv_sender_class = get_kv_class(TransferBackend.FAKE, KVClassType.SENDER)
+        else:
+            kv_sender_class = get_kv_class(self.transfer_backend, KVClassType.SENDER)
         req.disagg_kv_sender = kv_sender_class(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
@@ -272,19 +277,17 @@ class SchedulerDisaggregationPrefillMixin:
             next_token_ids,
             extend_input_len_per_req,
             extend_logprob_start_len_per_req,
-            bid,
         ) = (
             result.logits_output,
             result.next_token_ids,
             result.extend_input_len_per_req,
             result.extend_logprob_start_len_per_req,
-            result.bid,
         )
 
         # Transfer kv for prefill completed requests and add it into disagg_prefill_infight_queue
         if self.enable_overlap:
             # wait
-            _, next_token_ids = self.tp_worker.resolve_last_batch_result(launch_done)
+            _, next_token_ids, _ = self.tp_worker.resolve_last_batch_result(launch_done)
         else:
             next_token_ids = result.next_token_ids.tolist()
 
