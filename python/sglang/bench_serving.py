@@ -1736,7 +1736,7 @@ if __name__ == "__main__":
         help="Suffix applied to the end of all user prompts, followed by assistant prompt suffix.",
     )
     parser.add_argument(
-        "--pd-seperated",
+        "--pd-separated",
         action="store_true",
         help="Benchmark PD disaggregation server",
     )
