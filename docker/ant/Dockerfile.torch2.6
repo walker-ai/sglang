@@ -14,14 +14,10 @@ sed -i 's/base64\.encodestring/base64\.encodebytes/g' /opt/conda/lib/python3.10/
 
 pip install tokenizers==0.21.1
 
-# vllm版本比较低，依赖torch2.5.1所以，先装它然后再装torch
-echo "ant_vllm_073_dev: 4754911acfa9529bcbc12a2d4914f0bf512129d7 https://aci.alipay.com/project/119800126/pipeline/443011885?tenant_path=alipay&jobId=1277674102" > /home/admin/version.log
-pip install "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJ8c8337c713344a97add133d7f7156cfe/2025-04-01-11-29-43/vllm/vllm-0.7.3.post1.dev5%2Bg4754911ac.cu124.ant-cp310-cp310-linux_x86_64.whl?Expires=1746098985&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=ciylImUMHLKPBaqy2JtdDycmN88%3D"
-
 pip uninstall -y torch torchvision torchaudio
 pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 xformers==0.0.29.post2
 pip install toml pytest setuptools_scm outlines_core openai==1.58.1
-pip install --upgrade jinja2>=3.0
+pip install --upgrade jinja2
 find /usr -name libarchive.so.13 || echo "OK"
 rpm --rebuilddb && yum install -y libarchive
 find /usr -name libarchive.so.13
@@ -31,13 +27,22 @@ pip install python-prctl
 pip install decord && pip install torchao
 
 # FlashInfer安装
-echo "flashinfer: v0.2.3 fdedc432 https://aci.alipay.com/project/157400076/pipeline/455673934?tenant_path=alipay&jobId=1311258994" > /home/admin/version.log
-pip install "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJe749fa4b13b346849a6ca95739491b47/2025-04-22-04-38-19/flashinfer/flashinfer_python-0.2.3-cp38-abi3-linux_x86_64.whl?Expires=1747888705&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=6oQmt4jLull6fEOE8COcK5igvS4%3D"
+pip install "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJ33f3b3be61fc4495a17d35c17d5357ee/2025-04-30-08-14-08/flashinfer/flashinfer_python-0.2.5-cp38-abi3-linux_x86_64.whl?Expires=1748592854&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=v8%2BkuY7kqq3E%2FD9WwpM7aaxdKR4%3D"
 
 # sglang和sgl_kernel安装
-echo "sglang: main 4bcb56ef https://aci.alipay.com/project/161500101/pipeline/459023578?tenant_path=alipay&jobId=1322801224" >> /home/admin/version.log
-pip install "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJd445cee8a2084ac19469680f6af4e8f4/2025-05-12-11-22-47/sgl_kernel/sgl_kernel-0.1.0-cp39-abi3-linux_x86_64.whl?Expires=1749640968&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=4n0s2%2FkTfw5RYGlD5GCA8Cg2758%3D"
-pip install "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJd445cee8a2084ac19469680f6af4e8f4/2025-05-12-11-22-47/sglang/sglang-0.4.6-py3-none-any.whl?Expires=1749640967&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=dFIwMep5Pi2Zjibz1etIuhDppno%3D"
+wget "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJ0df06d446edb43c49f8240cc222e1831/2025-05-12-13-54-22/sgl_kernel/sgl_kernel-0.1.2.post1-cp39-abi3-linux_x86_64.whl?Expires=1749650064&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=8M3cbYX7TJY%2FzKvXN1BdJaSwYW4%3D" -O sgl_kernel-0.1.2.post1-cp39-abi3-linux_x86_64.whl
+wget "https://scmcenter.cn-hangzhou.alipay.aliyun-inc.com/antcodebuild/artifacts/WK50b0331b2cd74e1c862f92040aacb331/BJ0df06d446edb43c49f8240cc222e1831/2025-05-12-13-54-22/sglang/sglang-0.4.6.post3-py3-none-any.whl?Expires=1749650062&OSSAccessKeyId=bWwpuXuj5yuYKDDK&Signature=NU307kljq6P6Hja%2BWmqfJSgr%2Fwc%3D" -O sglang-0.4.6.post3-py3-none-any.whl
+pip install sgl_kernel-0.1.2.post1-cp39-abi3-linux_x86_64.whl
+pip install sglang-0.4.6.post3-py3-none-any.whl[all]
+
+#torch compile缓存
+wget "http://dmsint.cn-hangzhou.alipay.aliyun-inc.com/aistudio/temp/20250513/59fe566c0f7b41f6/inductor_root_cache.tar" -O inductor_root_cache.tar
+tar -xf inductor_root_cache.tar -C /home/admin/
+rm -rf inductor_root_cache.tar
+
+# 删除maya文件
+rm -rf /home/admin/maya_bin_cpu/
+rm -rf /home/admin/maya_bin_gpu/
 
 # 安装InfiniBand
 rpmdb -vv --rebuilddb && yum install -y libnl3-devel
