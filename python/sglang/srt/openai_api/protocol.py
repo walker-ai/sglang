@@ -394,6 +394,9 @@ class ChatCompletionRequest(BaseModel):
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
 
+    # The request id.
+    rid: Optional[Union[List[str], str]] = None
+
     trace_id: Optional[str] = None
 
     # For PD disaggregation
