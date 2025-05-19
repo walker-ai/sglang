@@ -395,7 +395,7 @@ class ChatCompletionRequest(BaseModel):
     chat_template_kwargs: Optional[Dict] = None
 
     # The request id.
-    rid: Optional[Union[List[str], str]] = None
+    rid: Optional[str] = None
 
     trace_id: Optional[str] = None
 
@@ -472,6 +472,9 @@ class EmbeddingRequest(BaseModel):
     encoding_format: str = "float"
     dimensions: int = None
     user: Optional[str] = None
+
+    # The request id.
+    rid: Optional[str] = None
 
 
 class EmbeddingObject(BaseModel):
