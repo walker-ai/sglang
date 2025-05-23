@@ -523,6 +523,13 @@ def get_dataset(args, tokenizer):
             fixed_output_len=args.random_output_len,
             random_sample=True,
         )
+    elif args.dataset_name == "custom-dataset":
+        input_requests = sample_custom_dataset(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            fixed_output_len=args.random_output_len,
+        )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     return input_requests
@@ -897,6 +904,31 @@ def sample_random_requests(
     print(f"#Input tokens: {np.sum(input_lens)}")
     print(f"#Output tokens: {np.sum(output_lens)}")
     return input_requests
+
+
+def sample_custom_dataset(
+    dataset_path: str,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    fixed_output_len: Optional[int] = None,
+) -> List[Tuple[str, int, int]]:
+    dataset = []
+    with open(dataset_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            dataset.append(json.loads(line))
+    prompts = [data['prompt'] for data in dataset]
+    reqs = []
+    max_input_len = 0
+    for prompt in prompts:
+        if len(reqs) == num_requests:
+            break
+        input_len = len(tokenizer.encode(prompt))
+        max_input_len = max(max_input_len, input_len)
+        reqs.append((prompt, input_len, fixed_output_len))
+    print(f"Dataset Prompts: {len(prompts)}")
+    print(f"Max Length of Prompt: {max_input_len}")
+    print(f"Total Requests: {len(reqs)}")
+    return reqs
 
 
 def gen_prompt(tokenizer, token_num):
@@ -1608,7 +1640,7 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "random", "random-ids", "generated-shared-prefix", "mmmu"],
+        choices=["sharegpt", "random", "random-ids", "generated-shared-prefix", "mmmu", "custom-dataset"],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
