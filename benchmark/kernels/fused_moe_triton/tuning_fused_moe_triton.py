@@ -423,6 +423,14 @@ def main(args: argparse.Namespace):
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // args.tp_size
+    elif config.architectures[0] in [
+            "BailingMoEForCausalLM",
+            "BailingMoeForCausalLM"
+    ]:
+        E = config.num_experts
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
+        shard_intermediate_size = 2 * intermediate_size // args.tp_size
     else:
         # Default: Mixtral
         E = config.num_local_experts
