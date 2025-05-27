@@ -314,9 +314,17 @@ class BailingMoEModel(nn.Module):
             prefix=add_prefix("word_embeddings", prefix),
         )
 
-        # tie_word_embeddings为true，复用tie_word_embeddings，反之是独立的
-        self.lm_head = self.word_embeddings if config.tie_word_embeddings \
-            else ParallelLMHead(self.vocab_size, self.embed_dim, quant_config=quant_config, prefix=add_prefix("lm_head", prefix),)
+        # TODO ParallelLMHead + dp attention目前有些问题，先使用普通的linear
+        assert not config.tie_word_embeddings
+        self.lm_head = ReplicatedLinear(
+            self.embed_dim,
+            self.vocab_size,
+            quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
+        )
+        # # tie_word_embeddings为true，复用tie_word_embeddings，反之是独立的
+        # self.lm_head = self.word_embeddings if config.tie_word_embeddings \
+        #     else ParallelLMHead(self.vocab_size, self.embed_dim, quant_config=quant_config, prefix=add_prefix("lm_head", prefix),)
 
         self.embedding_dropout = torch.nn.Dropout(config.embedding_dropout)
 
@@ -370,7 +378,7 @@ class BailingMoEForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.model = BailingMoEModel(config, quant_config, prefix=add_prefix("model", ""),)
         self.lm_head = self.model.lm_head
-        self.logits_processor = LogitsProcessor(config)
+        self.logits_processor = LogitsProcessor(config, skip_all_gather=True)
 
     @torch.no_grad()
     def forward(
