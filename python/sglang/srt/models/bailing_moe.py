@@ -55,6 +55,14 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, make_layers
 
+from sglang.srt.layers.dp_attention import (
+    dp_gather_partial,
+    dp_scatter,
+    get_attention_dp_size,
+    get_attention_tp_rank,
+    get_attention_tp_size,
+)
+
 LoraConfig = None
 
 
@@ -167,6 +175,7 @@ class BailingMoEAttention(nn.Module):
         config: BailingMoEConfig,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
+        reduce_results: bool = True,
         prefix: str = "",
     ):
         super().__init__()
@@ -177,22 +186,24 @@ class BailingMoEAttention(nn.Module):
         # kv头数（mha下跟total_num_heads相等，mqa或gqa小于total_num_heads）
         self.total_kv_heads = config.num_key_value_heads
         # 并发数
-        tp_size = get_tensor_model_parallel_world_size()
+        self.dp_size = get_attention_dp_size()
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
 
         # q 头或 kv头数要被tp整除
-        assert self.total_num_heads % tp_size == 0
-        assert self.total_kv_heads % tp_size == 0
+        assert self.total_num_heads % attn_tp_size == 0
+        assert self.total_kv_heads % attn_tp_size == 0
         assert self.total_num_heads >= self.total_kv_heads
 
         # 当前gpu rank下的q头
-        self.num_heads = self.total_num_heads // tp_size
+        self.num_heads = self.total_num_heads // attn_tp_size
         # 每个q头的维度
         self.head_dim = config.head_dim or (self.hidden_size // self.total_num_heads)
         # 当前gpu的q_size
         self.q_size = self.head_dim * self.num_heads
 
         # 当前gpu rank下的kv头
-        self.num_kv_heads = self.total_kv_heads // tp_size
+        self.num_kv_heads = self.total_kv_heads // attn_tp_size
         # 当前gpu的k/v维度
         self.kv_size = max(1, self.num_kv_heads * self.head_dim)
 
@@ -206,6 +217,8 @@ class BailingMoEAttention(nn.Module):
             bias=(config.use_bias or config.use_qkv_bias),
             quant_config=quant_config,
             prefix=add_prefix("query_key_value", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
         )
 
         self.dense = RowParallelLinear(
@@ -213,7 +226,10 @@ class BailingMoEAttention(nn.Module):
             self.hidden_size,
             bias=config.use_bias,
             quant_config=quant_config,
+            reduce_results=reduce_results,
             prefix=add_prefix("dense", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
         )
 
         self.rotary_emb = get_rope(
@@ -240,6 +256,8 @@ class BailingMoEAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        if hidden_states.shape[0] == 0:
+            return hidden_states
         qkv, _ = self.query_key_value(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
@@ -260,10 +278,12 @@ class BailingMoEBlock(nn.Module):
         hidden_size = config.hidden_size
 
         self.input_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
+        self.dp_size = get_attention_dp_size()
         self.attention = BailingMoEAttention(
             config,
             layer_id,
             quant_config,
+            reduce_results=False,
             prefix=add_prefix("attention", prefix),
         )
         self.mlp = BailingMoE(config, quant_config, prefix=add_prefix("mlp", prefix),)
@@ -277,11 +297,14 @@ class BailingMoEBlock(nn.Module):
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         # Self Attention
-        if residual is None:
+        if hidden_states.shape[0] == 0:
             residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         hidden_states = self.attention(
             positions=positions,
@@ -289,9 +312,34 @@ class BailingMoEBlock(nn.Module):
             forward_batch=forward_batch,
         )
 
+        # Gather
+        if get_tensor_model_parallel_world_size() > 1:
+            # all gather and all reduce
+            if self.dp_size !=1:
+                if get_attention_tp_rank() == 0:
+                    hidden_states += residual
+                hidden_states, local_hidden_states = (
+                    forward_batch.gathered_buffer,
+                    hidden_states,
+                )
+                dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
+                dp_scatter(residual, hidden_states, forward_batch)
+                hidden_states = self.post_attention_layernorm(hidden_states)
+            else:
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        else:
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
+
+        # scatter
+        if self.dp_size != 1:
+            hidden_states, global_hidden_states = (forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]],
+                                                   hidden_states,)
+            dp_scatter(hidden_states, global_hidden_states, forward_batch)
         return hidden_states, residual
 
 
@@ -312,6 +360,7 @@ class BailingMoEModel(nn.Module):
             self.embed_dim,
             quant_config=quant_config,
             prefix=add_prefix("word_embeddings", prefix),
+            enable_tp=not global_server_args_dict["enable_dp_attention"],
         )
 
         # TODO ParallelLMHead + dp attention目前有些问题，先使用普通的linear
@@ -363,7 +412,8 @@ class BailingMoEModel(nn.Module):
                 residual,
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if not forward_batch.forward_mode.is_idle():
+            hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
