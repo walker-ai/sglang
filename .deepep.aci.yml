@@ -1,0 +1,74 @@
+version: "2.0"
+parameters: #（选填）定义全局变量
+  base_train_image: reg.docker.alibaba-inc.com/aii/aistudio
+  base_train_image_version: 11880160-20250409174319
+  build_tag: test
+stages:
+- Build-Image
+- STC-Scan
+- Image-Scan
+- Push-Image
+
+jobs:
+  构建sglang镜像:
+    stage: Build-Image
+    component: docker-image-build
+    id: build-image
+    inputs:
+      imageName: reg.docker.alibaba-inc.com/augusto/deepep-base # 构建产物镜像名称(不含tag), 如: reg.docker.alibaba-inc.com/antcodebuild/test-image-build
+      imageTag: ${{vcs.commitShortSha}}-${{pipeline.currentTimestamp}} # 构建产物镜像 tag
+      dockerfile: ./docker/ant/Dockerfile.deepep # dockerfile 路径，不传默认为 ./Dockerfile (即: ${ACB_BUILD_DIR}/code-repo/Dockerfile)
+      contextDir: ./ # docker build 的 context 目录，不传默认为 ./ (即: ${ACB_BUILD_DIR}/code-repo 目录)
+      buildArgs: BASE_TRAIN_IMAGE=${{parameters.base_train_image}}:${{parameters.base_train_image_version}} # docker build 的 args 参数，格式为 key1=value1,key2=value2，注意key/value的格式，不能有空格、双引号等特殊字符
+      compression: uncompressed # 为新创建和缓存的镜像层选择压缩类型，默认值为未压缩uncompressed
+      forceCompression: false # 对所有镜像层强制应用压缩类型compression(包括已经存在的层)
+      registryUsername: null # 镜像 registry 用户名，建议使用 aci secrets 方式传递，避免泄露 (reg.docker.alibaba-inc.com、acs-reg.alipay.com 不传时默认使用平台公共账号 admin.for.antb)
+      registryPassword: null # 镜像 registry 密码，建议使用 aci secrets 方式传递，避免泄露 (不传使用平台公共账号)
+      skipWhenImageExists: null # true | false, 如果镜像已存在，是否跳过镜像构建，默认 false
+      errWhenImageExists: null # true | false, 如果镜像已存在，是否直接失败，默认 true
+      beforeScript: null # 前置脚本，按需传递 (在 ${ACB_BUILD_DIR}/code-repo 下执行)
+      beforeScriptImage: null  # 指定前置脚本运行环境镜像，beforeScript 不为空时需要传值(不传使用默认基础alios镜像)
+      afterScript: null # 后置脚本，按需传递 (在 ${ACB_BUILD_DIR}/code-repo 下执行)
+      afterScriptImage: null  # 指定后置脚本运行环境镜像，afterScript 不为空时需要传值(不传使用默认基础alios镜像)
+      nydusSwitch: true # 是否一并构建 nydus 加速镜像，true | false，默认为 true。详细信息：https://yuque.antfin-inc.com/tuna/nydus/pmlc56l8svt95ilh#i7Q1f
+      nydusPreheat: "" # 在哪些集群预热 nydus 加速镜像，通常只有国际集群才需要预热，默认不设置。详细信息：https://yuque.antfin-inc.com/tuna/nydus/ud4aiwfegqpu9qbd#SutsQ
+      cacheStrategy: always # 镜像构建是否使用缓存，默认 always
+      target: "" # Set the target build stage to build，extraTags中同样可以设置target，优先级参考下方文档描述
+      extraTags: null # 可指定多个 (当前最多支持5个) 额外的构建镜像Tag, 格式参考下方文档描述 (如需推送到其他镜像中心，还需要配置对应的账密)
+      scriptCaches: null # 自定义缓存
+      timeoutInSec: 6000 # 构建任务执行超时时间，单位(秒)
+      strictLabel: largeResource # 使用性能更好的机器
+  STC:
+    stage: STC-Scan
+    id: sct-scan
+    component: stc
+    inputs:
+      appName: sglang
+      image: reg.docker.alibaba-inc.com/augusto/deepep-base:${{vcs.commitShortSha}}-${{pipeline.currentTimestamp}}
+      projectType: AIDC
+  镜像扫描:
+    stage: Image-Scan
+    id: image-scan-core
+    component: image-scan
+    inputs:
+      appName: sglang
+      image: reg.docker.alibaba-inc.com/augusto/deepep-base:${{vcs.commitShortSha}}-${{pipeline.currentTimestamp}}
+      tenant: AIDC # 或者其他，比如 AIDC，这个必须要和镜像同步组件的租户一致
+
+  推送sglang镜像:
+    stage: Push-Image
+    component: image-sync-from-alipay-to-ats
+    id: push-image
+    config:
+      beforeExecute:
+        confirm:
+          buttonName: 确认推送
+    inputs:
+      checkImageAndStc: false
+      sourceImage: reg.docker.alibaba-inc.com/augusto/deepep-base:${{vcs.commitShortSha}}-${{pipeline.currentTimestamp}}
+      targetImage: acr-sh-ant-registry-vpc.cn-shanghai.cr.aliyuncs.com/sglang/deepep-base:${{vcs.commitShortSha}}-${{pipeline.currentTimestamp}}
+      appName: sglang
+      tenant: AIDC # 或者其他，比如 AIDC，这个必须要和镜像扫描组件的租户一致
+      retry: 10
+      imageType: oci,nydus
+

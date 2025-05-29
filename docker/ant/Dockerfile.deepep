@@ -1,0 +1,64 @@
+ARG BASE_TRAIN_IMAGE
+
+FROM ${BASE_TRAIN_IMAGE}
+LABEL authors="moyun.zty"
+
+WORKDIR /sgl-workspace
+
+
+RUN yum install -y libnl3 libnl3-devel mesa-libGL numactl && yum clean all
+RUN wget "https://gosspublic.alicdn.com/ossutil/v2/2.1.1/ossutil-2.1.1-linux-amd64.zip" && \
+    unzip ossutil-2.1.1-linux-amd64.zip -d /usr/local/ && \
+    chmod +x /usr/local/ossutil-2.1.1-linux-amd64/ossutil && \
+    ln -s /usr/local/ossutil-2.1.1-linux-amd64/ossutil /usr/local/bin/ossutil && \
+    rm -vf ossutil-2.1.1-linux-amd64.zip 
+
+
+COPY ./docker/ant/.xccl_env.sh /root/
+RUN echo -e '\n#初始化XCCL相关网络环境变量\nsource /root/.xccl_env.sh\n' >> /root/.bashrc
+
+RUN curl -o rdma-a100.tgz "http://dmsint.cn-hangzhou.alipay.aliyun-inc.com/aistudio%2Fgpu%2Frdma-a100.tgz" && \
+    ls -alh rdma-a100.tgz && \
+    tar --no-same-owner -xvf rdma-a100.tgz && \
+    rpm -Uvh rdma-a100/nic-libs-mellanox-rdma-5.2-2.x86_64.rpm && \
+    rm -rf rdma-a100 rdma-a100.tgz 
+
+RUN python3 -m pip install --upgrade pip
+
+# 安装运行sglang依赖的包
+RUN pip install transformers openai
+RUN pip install cuda-bindings==12.9.0 cuda-python==12.9.0 uvloop compressed_tensors msgspec einops partial_json_parser pynvml
+RUN pip3 install torchao flashinfer-python xgrammar==0.1.19
+
+# RUN pip3 config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+# Mooncake安装
+RUN pip3 install ant-mooncake-transfer-engine==0.3.0 -i https://artifacts.antgroup-inc.cn/artifact/repositories/simple-dev/
+# Mooncake 依赖包
+
+
+# 编译安装FlashMLA
+RUN pip3 install 'https://artifacts.antgroup-inc.cn/artifact/repositories/simple-dev/flash-mla/flash_mla-1.0.0+9edee0c-cp310-cp310-linux_x86_64.whl' 
+
+# 安装deepep
+RUN pip install 'https://artifacts.antgroup-inc.cn/artifact/repositories/simple-dev/ant-deep-ep/ant_deep_ep-0.0.2+7cad1c0-cp310-cp310-linux_x86_64.whl'
+
+# 编译安装deep-gemm
+RUN pip3 install 'https://artifacts.antgroup-inc.cn/artifact/repositories/simple-dev/deep-gemm/deep_gemm-1.0.0+e2d6a10-py3-none-any.whl'
+
+# 重新安装deep-gemm之后，需要重装下sgl_kernel
+RUN pip3 install 'http://antsys-sigmatest.cn-heyuan-alipay-office.oss-alipay.aliyuncs.com/tmp/sglang/sgl_kernel-0.1.2.post1-cp39-abi3-linux_x86_64.whl'
+
+
+# 安装sglang
+COPY . /sgl-workspace/SGLang
+
+WORKDIR SGLang
+RUN pip3 install -r docs/requirements.txt \
+    -i http://mirrors.aliyun.com/pypi/simple/ \
+    --trusted-host mirrors.aliyun.com 
+RUN pip3 install --no-cache-dir -e "python" \
+    -i http://mirrors.aliyun.com/pypi/simple/ \
+    --trusted-host mirrors.aliyun.com 
+
+WORKDIR /root/
+
