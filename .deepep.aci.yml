@@ -3,6 +3,7 @@ parameters: #（选填）定义全局变量
   base_train_image: reg.docker.alibaba-inc.com/aii/aistudio
   base_train_image_version: 11880160-20250409174319
   build_tag: test
+  sgl_kernel_whl_url: "http://antsys-sigmatest.cn-heyuan-alipay-office.oss-alipay.aliyuncs.com/tmp/sglang/sgl_kernel-0.1.2.post1-cp39-abi3-linux_x86_64.whl"
 stages:
 - Build-Image
 - STC-Scan
@@ -19,7 +20,7 @@ jobs:
       imageTag: ${{vcs.commitShortSha}}-${{pipeline.currentTimestamp}} # 构建产物镜像 tag
       dockerfile: ./docker/ant/Dockerfile.deepep # dockerfile 路径，不传默认为 ./Dockerfile (即: ${ACB_BUILD_DIR}/code-repo/Dockerfile)
       contextDir: ./ # docker build 的 context 目录，不传默认为 ./ (即: ${ACB_BUILD_DIR}/code-repo 目录)
-      buildArgs: BASE_TRAIN_IMAGE=${{parameters.base_train_image}}:${{parameters.base_train_image_version}} # docker build 的 args 参数，格式为 key1=value1,key2=value2，注意key/value的格式，不能有空格、双引号等特殊字符
+      buildArgs: BASE_TRAIN_IMAGE=${{parameters.base_train_image}}:${{parameters.base_train_image_version}},SGL_KERNEL_WHL_URL=${{parameters.sgl_kernel_whl_url}} # docker build 的 args 参数，格式为 key1=value1,key2=value2，注意key/value的格式，不能有空格、双引号等特殊字符
       compression: uncompressed # 为新创建和缓存的镜像层选择压缩类型，默认值为未压缩uncompressed
       forceCompression: false # 对所有镜像层强制应用压缩类型compression(包括已经存在的层)
       registryUsername: null # 镜像 registry 用户名，建议使用 aci secrets 方式传递，避免泄露 (reg.docker.alibaba-inc.com、acs-reg.alipay.com 不传时默认使用平台公共账号 admin.for.antb)
