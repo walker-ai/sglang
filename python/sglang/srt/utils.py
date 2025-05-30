@@ -2268,6 +2268,14 @@ def read_system_prompt_from_file(model_name: str) -> str:
         return ""
 
 
+def bind_or_assign(target, source):
+    if target is not None:
+        target.copy_(source)
+        return target
+    else:
+        return source
+
+
 def extract_numa_id(device_id):
     return device_id.split(':')[0]
 
