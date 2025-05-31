@@ -1406,7 +1406,6 @@ def get_device_name(device_id: int = 0) -> str:
         # 蚂蚁的H200卡型号是L20X😂
         device_name_map = {
             "NVIDIA L20X": "NVIDIA H200",
-            "NVIDIA H20-3e": "NVIDIA H20",
         }
         return device_name_map.get(device_name, device_name)
 
