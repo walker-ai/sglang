@@ -1397,13 +1397,10 @@ class ServerArgs:
             default=ServerArgs.deepep_config,
             help="Tuned DeepEP config suitable for your own cluster. It can be either a string with JSON content or a file path.",
         )
-
         parser.add_argument(
-            "--num-fused-shared-experts",
-            type=int,
-            default=0,
-            help="The number of shared_experts need to be replicated to fuse with normal experts in deepseek v3/r1, "
-            "set it to tp_size can get best optimized performance. Note that for architectures with SM==90, we have enabled the shared experts fusion optimization by default for DeepSeek V3/R1, with num_fused_shared_experts automatically set to the TP size.",
+            "--disable-shared-experts-fusion",
+            action="store_true",
+            help="Disable shared experts fusion optimization for deepseek v3/r1.",
         )
         parser.add_argument(
             "--disable-shared-experts-fusion",
