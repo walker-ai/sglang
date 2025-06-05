@@ -394,6 +394,9 @@ class ChatCompletionRequest(BaseModel):
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
 
+    # The request id.
+    rid: Optional[str] = None
+
     trace_id: Optional[str] = None
 
     # For PD disaggregation
@@ -414,7 +417,7 @@ class ChatCompletionResponseChoice(BaseModel):
     message: ChatMessage
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Literal[
-        "stop", "length", "tool_calls", "content_filter", "function_call"
+        "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
     ]
     matched_stop: Union[None, int, str] = None
 
@@ -469,6 +472,9 @@ class EmbeddingRequest(BaseModel):
     encoding_format: str = "float"
     dimensions: int = None
     user: Optional[str] = None
+
+    # The request id.
+    rid: Optional[str] = None
 
 
 class EmbeddingObject(BaseModel):
