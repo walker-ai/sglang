@@ -251,9 +251,6 @@ class ServerArgs:
 
         gpu_mem = get_device_memory_capacity(self.device)
 
-        if is_hip():
-            self.disable_shared_experts_fusion = True
-
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
             parallel_size = self.tp_size * self.pp_size
@@ -1414,11 +1411,6 @@ class ServerArgs:
             "--disable-shared-experts-fusion",
             action="store_true",
             help="Disable shared experts fusion optimization for deepseek v3/r1.",
-        )
-        parser.add_argument(
-            "--disable-shared-experts-fusion",
-            action="store_true",
-            help="Disable shared experts fusion by setting n_share_experts_fusion to 0.",
         )
         parser.add_argument(
             "--disable-chunked-prefix-cache",
