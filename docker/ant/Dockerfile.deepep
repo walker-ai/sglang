@@ -46,19 +46,21 @@ RUN pip install 'https://artifacts.antgroup-inc.cn/artifact/repositories/simple-
 RUN pip3 install 'https://artifacts.antgroup-inc.cn/artifact/repositories/simple-dev/deep-gemm/deep_gemm-1.0.0+e2d6a10-py3-none-any.whl'
 
 # 重新安装deep-gemm之后，需要重装下sgl_kernel
-RUN pip3 install 'http://antsys-sigmatest.cn-heyuan-alipay-office.oss-alipay.aliyuncs.com/tmp/sglang/sgl_kernel-0.1.2.post1-cp39-abi3-linux_x86_64.whl'
+ARG SGL_KERNEL_WHL_URL
+ARG SGLANG_WHL_URL
+RUN echo ${SGL_KERNEL_WHL_URL} " "  ${SGLANG_WHL_URL}
+RUN pip3 install --force-reinstall --no-deps ${SGL_KERNEL_WHL_URL}
 
 
-# 安装sglang
+# 安装sglang 和依赖
 COPY . /sgl-workspace/SGLang
 
 WORKDIR SGLang
 RUN pip3 install -r docs/requirements.txt \
     -i http://mirrors.aliyun.com/pypi/simple/ \
     --trusted-host mirrors.aliyun.com 
-RUN pip3 install --no-cache-dir -e "python" \
-    -i http://mirrors.aliyun.com/pypi/simple/ \
-    --trusted-host mirrors.aliyun.com 
+
+RUN pip3 install --force-reinstall  --no-deps ${SGLANG_WHL_URL}
 
 WORKDIR /root/
 

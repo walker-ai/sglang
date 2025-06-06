@@ -1,0 +1,76 @@
+version: "2.0"
+
+parameters:
+  base_build_image: reg.docker.alibaba-inc.com/augusto/sglang_build:sglang-v1.1  #自定义的构建镜像, 这个镜像里包含torch2.8-dev+cu128+gcc102+py310
+
+stages:
+- 构建&发布到测试库
+
+jobs:
+  构建并发布到测试库:
+    stage: 构建&发布到测试库
+    id: build
+    component: ant-cxx-build
+    inputs:
+      environmentLabel: ant-cxx-build
+      gitDepth: 1000
+      framework: custom
+      image: ${{parameters.base_build_image}}
+      timeout: 10800
+      workspaceCachePath: /.cache/daily
+      script: |
+        set -e 
+        set -x
+        rpm --rebuilddb && yum install -y ccache -b current
+        export ACI_VAR_OSS_URL="${{secrets.OSS_URL}}"
+        export ACI_VAR_OSS_AI="${{secrets.OSS_AI}}"
+        export ACI_VAR_OSS_AK="${{secrets.OSS_AK}}"
+        export ACI_COMMIT_SHA="${{parameters.ACI_COMMIT_SHA}}"
+        export CCACHE_DIR="/.cache/daily"
+        export CCACHE_BACKEND=""
+        export CCACHE_KEEP_LOCAL_STORAGE="TRUE"
+        unset CCACHE_READONLY
+        pip3 install uv build scikit-build-core scikit-build
+        git config --global url."git@code.alipay.com:maya-inference-server/cutlass.git".insteadOf https://github.com/NVIDIA/cutlass
+        git config --global url."git@code.alipay.com:maya-inference-server/cutlass.git".insteadOf https://github.com/NVIDIA/cutlass.git 
+        git config --global url."git@code.alipay.com:inference/DeepGEMM.git".insteadOf https://github.com/deepseek-ai/DeepGEMM.git
+        git config --global url."git@code.alipay.com:inference/DeepGEMM.git".insteadOf https://github.com/deepseek-ai/DeepGEMM
+        git config --global url."git@code.alipay.com:inference/flashinfer.git".insteadOf https://github.com/sgl-project/flashinfer.git
+        git config --global url."git@code.alipay.com:inference/sgl-attn.git".insteadOf https://github.com/sgl-project/sgl-attn.git
+        git config --global url."git@code.alipay.com:inference/sgl-attn.git".insteadOf https://github.com/sgl-project/sgl-attn
+        git config --global url."git@code.alipay.com:inference_thirdparty/cccl.git".insteadOf https://github.com/NVIDIA/cccl.git
+        git config --global url."git@code.alipay.com:inference/flashinfer.git".insteadOf https://github.com/flashinfer-ai/flashinfer.git
+        git config --global url."git@code.alipay.com:inference_thirdparty/turbomind.git".insteadOf https://github.com/InternLM/turbomind
+        git config --global url."git@code.alipay.com:inference_thirdparty/spdlog.git".insteadOf https://github.com/gabime/spdlog.git
+        git config --global url."git@code.alipay.com:inference_thirdparty/googletest.git".insteadOf https://github.com/google/googletest.git
+        git config --global url."git@code.alipay.com:inference_thirdparty/nvbench.git".insteadOf https://github.com/NVIDIA/nvbench.git
+        git config --global url."git@code.alipay.com:inference_thirdparty/mscclpp.git".insteadOf https://github.com/microsoft/mscclpp.git
+        git config --global url."git@code.alipay.com:inference/composable_kernel.git".insteadOf https://github.com/ROCm/composable_kernel.git
+        curl http://dmsint.cn-hangzhou.alipay.aliyun-inc.com/noao/yuhong.gyh/ssh_key/run_with_ssh_key.sh | bash -s "for i in {1..20}; do git submodule update --init --resursive --depth 5; if [ $? -eq 0 ]; then exit 0; fi; done"
+        export UV_NO_BUILD_ISOLATION=1
+        export MAX_JOBS=20
+        export CMAKE_BUILD_PARALLEL_LEVEL=20
+        export TORCH_CUDA_ARCH_LIST='7.5 8.0 8.9 9.0+PTX'
+        export CUDA_VERSION=12.8
+        cd ./sgl-kernel && curl http://dmsint.cn-hangzhou.alipay.aliyun-inc.com/noao/yuhong.gyh/ssh_key/run_with_ssh_key.sh | bash -s "uv build --wheel -Cbuild-dir=build . --verbose --color=always --no-build-isolation  -p $(which python)"
+        wheel_file=$(ls -1 "dist/" | head -n 1)
+        echo "ACB_BUILD_DIR=${ACB_BUILD_DIR}"
+        mkdir -p ${ACB_BUILD_DIR}/code-repo/aci/artifacts/
+        cp dist/${wheel_file} -p ${ACB_BUILD_DIR}/code-repo/aci/artifacts/
+        cd ../python
+        cp ../README.md ../LICENSE .
+        rm -rf dist
+        python3 -m build
+        wheel_file=$(ls -1 "dist/" | head -n 1)
+        echo "ACB_BUILD_DIR=${ACB_BUILD_DIR}"
+        cp dist/${wheel_file} -p ${ACB_BUILD_DIR}/code-repo/aci/artifacts/
+      
+      artifacts:
+      - name: sglang
+        type: file
+        path: ${ACB_BUILD_DIR}/code-repo/aci/artifacts/sglang*.whl
+      - name: sgl_kernel
+        type: file
+        path: ${ACB_BUILD_DIR}/code-repo/aci/artifacts/sgl_kernel*.whl
+
+
