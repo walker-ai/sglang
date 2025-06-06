@@ -210,7 +210,6 @@ class ServerArgs:
     flashinfer_mla_disable_ragged: bool = False
     warmups: Optional[str] = None
     moe_dense_tp_size: Optional[int] = None
-    num_fused_shared_experts: int = 0
     disable_shared_experts_fusion: bool = False
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
