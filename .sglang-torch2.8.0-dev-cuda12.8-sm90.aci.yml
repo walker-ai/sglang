@@ -46,7 +46,7 @@ jobs:
         git config --global url."git@code.alipay.com:inference_thirdparty/nvbench.git".insteadOf https://github.com/NVIDIA/nvbench.git
         git config --global url."git@code.alipay.com:inference_thirdparty/mscclpp.git".insteadOf https://github.com/microsoft/mscclpp.git
         git config --global url."git@code.alipay.com:inference/composable_kernel.git".insteadOf https://github.com/ROCm/composable_kernel.git
-        curl http://dmsint.cn-hangzhou.alipay.aliyun-inc.com/noao/yuhong.gyh/ssh_key/run_with_ssh_key.sh | bash -s "for i in {1..20}; do git submodule update --init --resursive --depth 5; if [ $? -eq 0 ]; then exit 0; fi; done"
+        curl http://dmsint.cn-hangzhou.alipay.aliyun-inc.com/noao/yuhong.gyh/ssh_key/run_with_ssh_key.sh | bash -s "for i in {1..20}; do git submodule update --init --recursive --depth 5; if [ $? -eq 0 ]; then exit 0; fi; done"
         export UV_NO_BUILD_ISOLATION=1
         export MAX_JOBS=20
         export CMAKE_BUILD_PARALLEL_LEVEL=20
