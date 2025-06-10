@@ -28,9 +28,8 @@ else:
 import logging
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _use_aiter:
+if _is_hip:
     from aiter import ActivationType
     from aiter.fused_moe_bf16_asm import ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
@@ -105,7 +104,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if _use_aiter:
+        if _is_hip and get_bool_env_var("SGLANG_AITER_MOE"):
             layer.w13_weight = torch.nn.Parameter(
                 shuffle_weight(layer.w13_weight.data, (16, 16)),
                 requires_grad=False,
@@ -128,7 +127,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         use_grouped_topk: bool,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
@@ -146,7 +144,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             use_grouped_topk=use_grouped_topk,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
             activation=activation,
@@ -166,7 +163,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         renormalize: bool,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         activation: str = "silu",
@@ -183,13 +179,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             renormalize=renormalize,
             topk_group=topk_group,
             num_expert_group=num_expert_group,
-            num_fused_shared_experts=num_fused_shared_experts,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
         )
 
-        if _use_aiter:
+        if _is_hip and get_bool_env_var("SGLANG_AITER_MOE"):
             assert not no_combine, "unsupported"
             if apply_router_weight_on_input:
                 assert (
@@ -225,7 +220,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 activation=activation,
                 apply_router_weight_on_input=apply_router_weight_on_input,
                 no_combine=no_combine,
-                routed_scaling_factor=routed_scaling_factor,
             )
 
     def forward_cpu(
@@ -238,7 +232,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         renormalize: bool,
         topk_group: Optional[int] = None,
         num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: int = 0,
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
         inplace: bool = True,
@@ -252,7 +245,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             renormalize,
             topk_group,
             num_expert_group,
-            num_fused_shared_experts,
             custom_routing_function,
             correction_bias,
         )
@@ -297,7 +289,6 @@ class FusedMoE(torch.nn.Module):
         renormalize: bool = True,
         use_grouped_topk: bool = False,
         num_expert_group: Optional[int] = None,
-        num_fused_shared_experts: int = 0,
         topk_group: Optional[int] = None,
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
@@ -316,7 +307,6 @@ class FusedMoE(torch.nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
 
-        self.hidden_size = hidden_size
         self.tp_size = (
             tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
         )
@@ -331,7 +321,6 @@ class FusedMoE(torch.nn.Module):
         if self.use_grouped_topk:
             assert num_expert_group is not None and topk_group is not None
         self.num_expert_group = num_expert_group
-        self.num_fused_shared_experts = num_fused_shared_experts
         self.topk_group = topk_group
         self.custom_routing_function = custom_routing_function
         self.correction_bias = correction_bias
@@ -557,8 +546,7 @@ class FusedMoE(torch.nn.Module):
             loaded_weight = loaded_weight.to(param.data.device)
 
             if (
-                "compressed" in self.quant_method.__class__.__name__.lower()
-                and param.data[expert_id] != 1
+                param.data[expert_id] != 1
                 and (param.data[expert_id] - loaded_weight).abs() > 1e-5
             ):
                 raise ValueError(
@@ -581,23 +569,6 @@ class FusedMoE(torch.nn.Module):
                 expert_data=expert_data,
                 tp_rank=tp_rank,
             )
-            return
-        if "ModelOpt" in self.quant_method.__class__.__name__:
-            if "weight_scale_2" in weight_name or "input_scale" in weight_name:
-                self._load_per_tensor_weight_scale(
-                    shard_id=shard_id,
-                    param=param,
-                    loaded_weight=loaded_weight,
-                    expert_id=expert_id,
-                )
-            elif "weight" in weight_name:
-                self._load_model_weight_or_group_weight_scale(
-                    shard_id=shard_id,
-                    shard_dim=shard_dim,
-                    loaded_weight=loaded_weight,
-                    expert_data=expert_data,
-                    tp_rank=tp_rank,
-                )
             return
 
         # Case weight scales and zero_points
@@ -680,7 +651,6 @@ class FusedMoE(torch.nn.Module):
             use_grouped_topk=self.use_grouped_topk,
             topk_group=self.topk_group,
             num_expert_group=self.num_expert_group,
-            num_fused_shared_experts=self.num_fused_shared_experts,
             custom_routing_function=self.custom_routing_function,
             correction_bias=self.correction_bias,
             activation=self.activation,

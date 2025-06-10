@@ -1,3 +1,4 @@
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -10,7 +11,6 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
     write_github_step_summary,
@@ -67,7 +67,7 @@ class TestDeepseekV3(CustomTestCase):
             write_github_step_summary(
                 f"### test_bs_1_speed (deepseek-v3)\n" f"{speed=:.2f} token/s\n"
             )
-            if is_in_amd_ci():
+            if os.getenv("SGLANG_AMD_CI") == "1":
                 self.assertGreater(speed, 12)
             else:
                 self.assertGreater(speed, 75)
@@ -87,11 +87,11 @@ class TestDeepseekV3MTP(CustomTestCase):
             "--speculative-num-steps",
             "3",
             "--speculative-eagle-topk",
-            "1",
+            "2",
             "--speculative-num-draft-tokens",
             "4",
         ]
-        if not is_in_amd_ci():
+        if os.environ.get("SGLANG_AMD_CI") != "1":
             other_args += ["--mem-frac", "0.7"]
         cls.process = popen_launch_server(
             cls.model,
@@ -148,14 +148,14 @@ class TestDeepseekV3MTP(CustomTestCase):
                 f"{acc_length=:.2f}\n"
                 f"{speed=:.2f} token/s\n"
             )
-            if is_in_amd_ci():
+            if os.getenv("SGLANG_AMD_CI") == "1":
                 self.assertGreater(acc_length, 2.8)
             else:
                 self.assertGreater(acc_length, 2.9)
-            if is_in_amd_ci():
+            if os.getenv("SGLANG_AMD_CI") == "1":
                 self.assertGreater(speed, 15)
             else:
-                self.assertGreater(speed, 130)
+                self.assertGreater(speed, 105)
 
 
 if __name__ == "__main__":

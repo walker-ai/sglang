@@ -109,7 +109,3 @@ class AttentionBackend(ABC):
     ):
         """Run a forward for extend."""
         raise NotImplementedError()
-
-    def support_triton(self):
-        """Check if the current backend supports triton."""
-        return True

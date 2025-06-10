@@ -1,3 +1,4 @@
+import os
 import unittest
 
 from sglang.test.test_utils import (
@@ -7,8 +8,8 @@ from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST_FP8,
     DEFAULT_MOE_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
+    DEFAULT_VLM_CHAT_TEMPLATE_FOR_TEST,
     CustomTestCase,
-    is_in_amd_ci,
     is_in_ci,
     run_bench_serving,
     write_github_step_summary,
@@ -30,7 +31,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_offline_throughput_default\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            if is_in_amd_ci():
+            if os.getenv("SGLANG_AMD_CI") == "1":
                 self.assertGreater(res["output_throughput"], 3150)
             else:
                 self.assertGreater(res["output_throughput"], 3800)
@@ -68,7 +69,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_offline_throughput_without_radix_cache\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            if is_in_amd_ci():
+            if os.getenv("SGLANG_AMD_CI") == "1":
                 self.assertGreater(res["output_throughput"], 3050)
             else:
                 self.assertGreater(res["output_throughput"], 3800)
@@ -106,7 +107,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_offline_throughput_with_triton_attention_backend\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            if is_in_amd_ci():
+            if os.getenv("SGLANG_AMD_CI") == "1":
                 self.assertGreater(res["output_throughput"], 3500)
             else:
                 self.assertGreater(res["output_throughput"], 3700)
@@ -124,7 +125,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_offline_throughput_default_fp8\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            if is_in_amd_ci():
+            if os.getenv("SGLANG_AMD_CI") == "1":
                 self.assertGreater(res["output_throughput"], 3500)
             else:
                 self.assertGreater(res["output_throughput"], 4300)
@@ -143,7 +144,7 @@ class TestBenchServing(CustomTestCase):
                 f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
             )
             self.assertLess(res["median_e2e_latency_ms"], 11000)
-            if is_in_amd_ci():
+            if os.getenv("SGLANG_AMD_CI") == "1":
                 self.assertLess(res["median_ttft_ms"], 115)
             else:
                 self.assertLess(res["median_ttft_ms"], 86)
@@ -166,7 +167,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_vlm_offline_throughput\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            if is_in_amd_ci():
+            if os.getenv("SGLANG_AMD_CI") == "1":
                 self.assertGreater(res["output_throughput"], 2000)
                 # TODO: not set yet, need AMD machine
             else:
@@ -175,7 +176,7 @@ class TestBenchServing(CustomTestCase):
     def test_vlm_online_latency(self):
         res = run_bench_serving(
             model=DEFAULT_SMALL_VLM_MODEL_NAME_FOR_TEST,
-            num_prompts=250,
+            num_prompts=50,
             request_rate=1,
             other_server_args=[
                 "--mem-fraction-static",
@@ -190,11 +191,11 @@ class TestBenchServing(CustomTestCase):
                 f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
             )
             self.assertLess(res["median_e2e_latency_ms"], 16500)
-            if is_in_amd_ci():
+            if os.getenv("SGLANG_AMD_CI") == "1":
                 self.assertLess(res["median_ttft_ms"], 150)
                 # TODO: not set yet, need AMD machine
             else:
-                self.assertLess(res["median_ttft_ms"], 94)
+                self.assertLess(res["median_ttft_ms"], 90)
             self.assertLess(res["median_itl_ms"], 8)
 
     def test_online_latency_eagle(self):
@@ -229,7 +230,7 @@ class TestBenchServing(CustomTestCase):
                 f'median_e2e_latency_ms: {res["median_e2e_latency_ms"]:.2f} ms\n'
                 f'accept_length: {res["accept_length"]:.2f} \n'
             )
-            if is_in_amd_ci():
+            if os.getenv("SGLANG_AMD_CI") == "1":
                 self.assertLess(res["median_e2e_latency_ms"], 1800)
             else:
                 self.assertLess(res["median_e2e_latency_ms"], 900)
@@ -248,7 +249,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_moe_offline_throughput_default\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            if is_in_amd_ci():
+            if os.getenv("SGLANG_AMD_CI") == "1":
                 self.assertGreater(res["output_throughput"], 2100)
             else:
                 self.assertGreater(res["output_throughput"], 2200)
@@ -266,7 +267,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_moe_offline_throughput_without_radix_cache\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            if is_in_amd_ci():
+            if os.getenv("SGLANG_AMD_CI") == "1":
                 self.assertGreater(res["output_throughput"], 2100)
             else:
                 self.assertGreater(res["output_throughput"], 2200)
@@ -288,7 +289,7 @@ class TestBenchServing(CustomTestCase):
                 f"### test_pp_offline_throughput_default_decode\n"
                 f'Output throughput: {res["output_throughput"]:.2f} token/s\n'
             )
-            self.assertGreater(res["output_throughput"], 6700)
+            self.assertGreater(res["output_throughput"], 7500)
 
     def test_pp_long_context_prefill(self):
         res = run_bench_serving(

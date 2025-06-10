@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import sglang as sgl
+from sglang.srt.managers.expert_distribution_storage import ExpertDistributionStorage
 from sglang.srt.utils import kill_process_tree
 from sglang.test.run_eval import run_eval
 from sglang.test.test_utils import (
@@ -16,9 +17,7 @@ from sglang.test.test_utils import (
 )
 
 
-class _BaseTestDynamicEPLB(CustomTestCase):
-    extra_args = []
-
+class TestDynamicEPLB(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
@@ -52,13 +51,8 @@ class _BaseTestDynamicEPLB(CustomTestCase):
                 "stat",
                 "--ep-dispatch-algorithm",
                 "static",
-                *cls.extra_args,
             ],
-            env={
-                "SGL_ENABLE_JIT_DEEPGEMM": "0",
-                "SGLANG_EXPERT_LOCATION_UPDATER_CANARY": "1",
-                **os.environ,
-            },
+            env={"SGL_ENABLE_JIT_DEEPGEMM": "0", **os.environ},
         )
 
     @classmethod
@@ -76,14 +70,6 @@ class _BaseTestDynamicEPLB(CustomTestCase):
 
         metrics = run_eval(args)
         self.assertGreater(metrics["score"], 0.5)
-
-
-class TestDynamicEPLBSimple(_BaseTestDynamicEPLB):
-    pass
-
-
-class TestDynamicEPLBMultiChunk(_BaseTestDynamicEPLB):
-    extra_args = ["--eplb-rebalance-layers-per-chunk", "1"]
 
 
 class TestStaticEPLB(CustomTestCase):

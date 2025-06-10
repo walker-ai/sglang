@@ -1,4 +1,4 @@
-name: Build DeepEP Docker Image
+name: Build Dev-DeepEP Docker Image
 
 on:
   workflow_dispatch:
@@ -32,5 +32,5 @@ jobs:
 
       - name: Build and Push DeepEP Image
         run: |
-          docker build . -f docker/Dockerfile.deepep -t lmsysorg/sglang:deepep --no-cache
-          docker push lmsysorg/sglang:deepep
+          docker build . -f docker/Dockerfile.dev-deepep -t lmsysorg/sglang:dev-deepep --no-cache
+          docker push lmsysorg/sglang:dev-deepep

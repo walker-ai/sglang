@@ -54,8 +54,7 @@ void shared_open(SharedData* data, const char* name, size_t nbytes) {
 void shared_create(SharedData* data, const char* name, void* bytes, size_t nbytes) {
   int d = shm_open(name, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
   if (d != -1) {
-    nbytes = write(d, bytes, nbytes);
-    if (nbytes > 0) {
+    if (nbytes = write(d, bytes, nbytes)) {
       shared_open(data, name, nbytes);
     }
   } else {
@@ -392,7 +391,7 @@ void reduce_fp32_buffers(int start_elements, int num_elements, char* to_buffer, 
 static bool is_initialized = false;
 static int world_rank;
 
-void shm_initialize(int size, int rank, const char* addr_string, const char* port_string) {
+void shm_initialize(int size, int rank, char* addr_string, char* port_string) {
   if (is_initialized) {
     return;
   }
@@ -410,7 +409,7 @@ void shm_initialize(int size, int rank, const char* addr_string, const char* por
   struct allreduce_workspace* workspace_buf;
   struct allreduce_workspace* workspace_buf_other;
   workspace_buf = (struct allreduce_workspace*)malloc(sizeof(struct allreduce_workspace));
-  snprintf(shm_name, NAME_BUF_SIZE, "%.900s_%d", shm_name_prefix, rank);
+  snprintf(shm_name, NAME_BUF_SIZE, "%s_%d", shm_name_prefix, rank);
   shared_create(&allreduce_buffer, shm_name, workspace_buf, sizeof(struct allreduce_workspace));
   workspace_buf = (struct allreduce_workspace*)allreduce_buffer.bytes;
   workspace_buf->states[0] = coll_alt2_allreduce_naive__copy_in_done;
@@ -426,7 +425,7 @@ void shm_initialize(int size, int rank, const char* addr_string, const char* por
   // map shm of all ranks
   for (int i = 0; i < size; i++) {
     if (i != rank) {
-      snprintf(shm_name, NAME_BUF_SIZE, "%.900s_%d", shm_name_prefix, i);
+      snprintf(shm_name, NAME_BUF_SIZE, "%s_%d", shm_name_prefix, i);
       // printf("open %s, %d\n", shm_name, rank);
       do {
         shared_open(&allreduce_buffer, shm_name, sizeof(struct allreduce_workspace));
@@ -448,13 +447,13 @@ static void parallel_memcpy(void* to, void* from, size_t n_bytes) {
   auto aligned_bytes = n_bytes - (n_bytes % VECTOR_LENGTH_IN_BYTES);
   // process aligned part
 #pragma omp parallel for
-  for (size_t i = 0; i < aligned_bytes; i += VECTOR_LENGTH_IN_BYTES) {
+  for (int i = 0; i < aligned_bytes; i += VECTOR_LENGTH_IN_BYTES) {
     auto val = _mm256_loadu_si256((__m256i*)((char*)from + i));
     _mm256_storeu_si256((__m256i*)((char*)to + i), val);
   }
 
   // process remaining part
-  for (size_t i = aligned_bytes; i < n_bytes; i++) {
+  for (int i = aligned_bytes; i < n_bytes; i++) {
     *((char*)to + i) = *((char*)from + i);
   }
 }
@@ -482,9 +481,7 @@ void symmetric_naive_all_reduce(char* data_ptr, c10::ScalarType scalar_type, siz
   static int current_buffer = 0;
   static int state_idx = 0;
 
-  // init states to case 0 to get rid of "maybe-uninitialized" warning.
-  enum coll_state copy_current = coll_allreduce_naive__copy_in_done;
-  enum coll_state copy_next = coll_alt1_allreduce_naive__copy_in_done;
+  enum coll_state copy_current, copy_next;
 
   switch (state_idx) {
     case 0:
@@ -529,10 +526,7 @@ void distributed_naive_reduce(char* data_ptr, c10::ScalarType scalar_type, size_
   static int current_buffer = 0;
   static int state_idx = 0;
 
-  // init states to case 0 to get rid of "maybe-uninitialized" warning.
-  enum coll_state copy_current = coll_allreduce_naive__copy_in_done;
-  enum coll_state reduce_current = coll_allreduce_naive__reduce_done;
-  enum coll_state copy_next = coll_alt1_allreduce_naive__copy_in_done;
+  enum coll_state copy_current, copy_next, reduce_current;
 
   // similar to symmetric_naive_allreduce, but here we only need two sets of
   // states, because distributed naive reduce has two barriers in the algorithm
@@ -607,9 +601,7 @@ void naive_all_gather(char* result_ptr, char* data_ptr, size_t res_stride, size_
   static int current_buffer = 0;
   static int state_idx = 0;
 
-  // init states to case 0 to get rid of "maybe-uninitialized" warning.
-  enum coll_state copy_current = coll_allgather_naive__copy_in_done;
-  enum coll_state copy_next = coll_alt1_allgather_naive__copy_in_done;
+  enum coll_state copy_current, copy_next;
 
   switch (state_idx) {
     case 0:
@@ -629,6 +621,7 @@ void naive_all_gather(char* result_ptr, char* data_ptr, size_t res_stride, size_
   }
   state_idx = (state_idx + 1) % 3;
 
+  int data_size = chunk_size / chunk_el;
   parallel_memcpy(distributed_buffer[current_buffer][world_rank], data_ptr, chunk_size);
   std::atomic_thread_fence(std::memory_order_release);
   workspace[world_rank]->states[state_group] = copy_current;
@@ -651,7 +644,7 @@ torch::Tensor& all_gather(torch::Tensor& result, torch::Tensor& data, int dim, s
   auto data_ptr = (char*)(data.data_ptr());
   auto result_ptr = (char*)(result.data_ptr());
   for (int i = 0; i < dim_count; i++) {
-    for (size_t offset = 0; offset < dim_size; offset += MAX_BUF_SIZE) {
+    for (int offset = 0; offset < dim_size; offset += MAX_BUF_SIZE) {
       size_t chunk_size = dim_size - offset > MAX_BUF_SIZE ? MAX_BUF_SIZE : dim_size - offset;
       size_t chunk_el = chunk_size / dtype_size;
       naive_all_gather(

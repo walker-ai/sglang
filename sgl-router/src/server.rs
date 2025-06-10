@@ -18,7 +18,7 @@ use tracing::{error, info, warn, Level};
 
 #[derive(Debug)]
 pub struct AppState {
-    router: Arc<Router>,
+    router: Router,
     client: Client,
 }
 
@@ -29,7 +29,7 @@ impl AppState {
         policy_config: PolicyConfig,
     ) -> Result<Self, String> {
         // Create router based on policy
-        let router = Arc::new(Router::new(worker_urls, policy_config)?);
+        let router = Router::new(worker_urls, policy_config)?;
         Ok(Self { router, client })
     }
 }
@@ -218,23 +218,24 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         .build()
         .expect("Failed to create HTTP client");
 
-    let app_state_init = AppState::new(
-        config.worker_urls.clone(),
-        client.clone(),
-        config.policy_config.clone(),
-    )
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-    let router_arc = Arc::clone(&app_state_init.router);
-    let app_state = web::Data::new(app_state_init);
+    let app_state = web::Data::new(
+        AppState::new(
+            config.worker_urls.clone(),
+            client.clone(), // Clone the client here
+            config.policy_config.clone(),
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
+    );
 
     // Start the service discovery if enabled
     if let Some(service_discovery_config) = config.service_discovery_config {
         if service_discovery_config.enabled {
-            info!("🚧 Initializing Kubernetes service discovery");
-            // Pass the Arc<Router> directly
-            match start_service_discovery(service_discovery_config, router_arc).await {
+            let worker_urls = Arc::clone(&app_state.router.get_worker_urls());
+
+            match start_service_discovery(service_discovery_config, worker_urls).await {
                 Ok(handle) => {
                     info!("✅ Service discovery started successfully");
+
                     // Spawn a task to handle the service discovery thread
                     spawn(async move {
                         if let Err(e) = handle.await {
@@ -251,10 +252,7 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
     }
 
     info!("✅ Serving router on {}:{}", config.host, config.port);
-    info!(
-        "✅ Serving workers on {:?}",
-        app_state.router.get_worker_urls().read().unwrap()
-    );
+    info!("✅ Serving workers on {:?}", config.worker_urls);
 
     HttpServer::new(move || {
         App::new()

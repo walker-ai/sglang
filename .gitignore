@@ -233,5 +233,3 @@ compile_commands.json
 
 # Rust lib
 Cargo.lock
-
-lmms-eval

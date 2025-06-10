@@ -18,7 +18,6 @@ import copy
 import dataclasses
 import json
 import logging
-import math
 import os
 import pickle
 import signal
@@ -43,7 +42,6 @@ from typing import (
 )
 
 import fastapi
-import torch
 import uvloop
 import zmq
 import zmq.asyncio
@@ -116,7 +114,6 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
-    get_bool_env_var,
     get_zmq_socket,
     kill_process_tree,
 )
@@ -224,7 +221,7 @@ class TokenizerManager:
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
         else:
-            self.mm_processor = None
+            self.mm_processor = get_dummy_processor()
 
             if server_args.skip_tokenizer_init:
                 self.tokenizer = self.processor = None
@@ -398,9 +395,6 @@ class TokenizerManager:
                 self.server_args.disaggregation_bootstrap_port
             )
 
-        self.current_load = 0
-        self.current_load_lock = asyncio.Lock()
-
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -428,8 +422,8 @@ class TokenizerManager:
             is_single = obj.is_single
             if is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
-                state = self._send_one_request(obj, tokenized_obj, created_time)
-                async for response in self._wait_one_response(obj, state, request):
+                self._send_one_request(obj, tokenized_obj, created_time)
+                async for response in self._wait_one_response(obj, request):
                     yield response
             else:
                 async for response in self._handle_batch_request(
@@ -465,7 +459,8 @@ class TokenizerManager:
                 )
             input_ids = self.tokenizer.encode(input_text)
 
-        if self.mm_processor and obj.contains_mm_input():
+        image_inputs: Optional[Dict] = None
+        if obj.contains_mm_input():
             image_inputs = await self.mm_processor.process_mm_data_async(
                 image_data=obj.image_data,
                 input_text=input_text or input_ids,
@@ -474,8 +469,6 @@ class TokenizerManager:
             )
             if image_inputs and "input_ids" in image_inputs:
                 input_ids = image_inputs["input_ids"]
-        else:
-            image_inputs: Optional[Dict] = None
 
         self._validate_token_len(obj, input_ids)
         return self._create_tokenized_object(
@@ -570,7 +563,6 @@ class TokenizerManager:
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
                 return_hidden_states=obj.return_hidden_states,
-                data_parallel_rank=obj.data_parallel_rank,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(
@@ -636,15 +628,15 @@ class TokenizerManager:
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
         self.rid_to_state[obj.rid] = state
-        return state
 
     async def _wait_one_response(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
-        state: ReqState,
         request: Optional[fastapi.Request] = None,
     ):
         """Wait for the response of one request."""
+        state = self.rid_to_state[obj.rid]
+
         while True:
             try:
                 await asyncio.wait_for(state.event.wait(), timeout=4)
@@ -714,16 +706,16 @@ class TokenizerManager:
 
                 for i, tokenized_obj in enumerate(tokenized_objs):
                     tmp_obj = obj[i]
-                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, state, request))
+                    self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
             else:
                 # Sequential tokenization and processing
                 for i in range(batch_size):
                     tmp_obj = obj[i]
                     tokenized_obj = await self._tokenize_one_request(tmp_obj)
-                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, state, request))
+                    self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
         else:
             # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
@@ -748,8 +740,8 @@ class TokenizerManager:
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
-                state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                await self._wait_one_response(tmp_obj, state, request).__anext__()
+                self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                await self._wait_one_response(tmp_obj, request).__anext__()
 
             # Expand requests, assign new rids for them, and send them
             for i in range(batch_size):
@@ -757,8 +749,8 @@ class TokenizerManager:
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
-                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
-                    generators.append(self._wait_one_response(tmp_obj, state, request))
+                    self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
 
         # Wait for all requests
@@ -794,9 +786,6 @@ class TokenizerManager:
         req = AbortReq(rid)
         self.send_to_scheduler.send_pyobj(req)
 
-        if self.enable_metrics:
-            self.metrics_collector.observe_one_aborted_request()
-
     async def start_profile(
         self,
         output_dir: Optional[str] = None,
@@ -804,11 +793,8 @@ class TokenizerManager:
         activities: Optional[List[str]] = None,
         with_stack: Optional[bool] = None,
         record_shapes: Optional[bool] = None,
-        profile_by_stage: bool = False,
     ):
         self.auto_create_handle_loop()
-        env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
-        with_stack = False if with_stack is False or env_with_stack is False else True
         req = ProfileReq(
             type=ProfileReqType.START_PROFILE,
             output_dir=output_dir,
@@ -816,7 +802,6 @@ class TokenizerManager:
             activities=activities,
             with_stack=with_stack,
             record_shapes=record_shapes,
-            profile_by_stage=profile_by_stage,
             profile_id=str(time.time()),
         )
         return await self._execute_profile(req)
@@ -856,7 +841,7 @@ class TokenizerManager:
             obj.load_format = self.server_args.load_format
         logger.info("Start update_weights. Load format=%s", obj.load_format)
 
-        if True:  # Keep this redundant check to simplify some internal code sync
+        if True:
             # Hold the lock if it is not async. This means that weight sync
             # cannot run while requests are in progress.
             async with self.model_update_lock.writer_lock:
@@ -997,14 +982,6 @@ class TokenizerManager:
         )
         # Many DP ranks
         return [res.internal_state for res in responses]
-
-    async def get_load(self) -> dict:
-        # TODO(lsyin): fake load report server
-        if not self.current_load_lock.locked():
-            async with self.current_load_lock:
-                internal_state = await self.get_internal_state()
-                self.current_load = internal_state[0]["load"]
-        return {"load": self.current_load}
 
     async def set_internal_state(
         self, obj: SetInternalStateReq
@@ -1423,7 +1400,7 @@ class TokenizerManager:
             asyncio.create_task(asyncio.to_thread(background_task))
 
     def _handle_abort_req(self, recv_obj):
-        self.rid_to_state.pop(recv_obj.rid, None)
+        self.rid_to_state.pop(recv_obj.rid)
 
     def _handle_open_session_req_output(self, recv_obj):
         self.session_futures[recv_obj.session_id].set_result(
@@ -1438,100 +1415,6 @@ class TokenizerManager:
             # set future if the all results are received
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
-
-    async def score_request(
-        self,
-        query: Optional[Union[str, List[int]]] = None,
-        items: Optional[Union[str, List[str], List[List[int]]]] = None,
-        label_token_ids: Optional[List[int]] = None,
-        apply_softmax: bool = False,
-        item_first: bool = False,
-        request: Optional[Any] = None,
-    ) -> List[List[float]]:
-        """
-        See Engine.score() for more details.
-        """
-        if label_token_ids is None:
-            raise ValueError("label_token_ids must be provided")
-
-        if self.tokenizer is not None:
-            vocab_size = self.tokenizer.vocab_size
-            for token_id in label_token_ids:
-                if token_id >= vocab_size:
-                    raise ValueError(
-                        f"Token ID {token_id} is out of vocabulary (vocab size: {vocab_size})"
-                    )
-
-        # Handle string or tokenized query/items
-        if isinstance(query, str) and (
-            isinstance(items, str)
-            or (isinstance(items, list) and (not items or isinstance(items[0], str)))
-        ):
-            # Both query and items are text
-            items_list = [items] if isinstance(items, str) else items
-            if item_first:
-                prompts = [f"{item}{query}" for item in items_list]
-            else:
-                prompts = [f"{query}{item}" for item in items_list]
-            batch_request = GenerateReqInput(
-                text=prompts,
-                return_logprob=True,
-                token_ids_logprob=label_token_ids,
-                stream=False,
-                sampling_params={"max_new_tokens": 1},
-            )
-        elif (
-            isinstance(query, list)
-            and isinstance(items, list)
-            and items
-            and isinstance(items[0], list)
-        ):
-            # Both query and items are token IDs
-            if item_first:
-                input_ids_list = [item + query for item in items]
-            else:
-                input_ids_list = [query + item for item in items]
-            batch_request = GenerateReqInput(
-                input_ids=input_ids_list,
-                return_logprob=True,
-                token_ids_logprob=label_token_ids,
-                stream=False,
-                sampling_params={"max_new_tokens": 1},
-            )
-        else:
-            raise ValueError(
-                "Invalid combination of query/items types for score_request."
-            )
-
-        results = await self.generate_request(batch_request, request).__anext__()
-        scores = []
-
-        for result in results:
-            # Get logprobs for each token
-            logprobs = {}
-            for logprob, token_id, _ in result["meta_info"].get(
-                "output_token_ids_logprobs", []
-            )[0]:
-                if token_id in label_token_ids:
-                    logprobs[token_id] = logprob
-
-            # Get scores in order of label_token_ids
-            score_list = [
-                logprobs.get(token_id, float("-inf")) for token_id in label_token_ids
-            ]
-
-            # Apply softmax to logprobs if needed
-            if apply_softmax:
-                score_list = torch.softmax(torch.tensor(score_list), dim=0).tolist()
-            else:
-                # Convert logprobs to probabilities if not using softmax
-                score_list = [
-                    math.exp(x) if x != float("-inf") else 0.0 for x in score_list
-                ]
-
-            scores.append(score_list)
-
-        return scores
 
 
 async def print_exception_wrapper(func):

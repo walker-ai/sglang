@@ -296,30 +296,23 @@ class Idefics2VisionTransformer(nn.Module):
     def compute_cu_seqlens(
         self,
         tgt_sizes: Optional[torch.Tensor] = None,
-        input_embeds: Optional[torch.Tensor] = None,
+        atch_attention_mask: Optional[torch.BoolTensor] = None,
     ) -> torch.Tensor:
         # shape: (batch_size,)
         if tgt_sizes is not None:
-            seqlen = tgt_sizes[:, 0] * tgt_sizes[:, 1]
-        elif input_embeds is not None:
-            seqlen = torch.full(
-                size=(input_embeds.shape[0],),
-                fill_value=input_embeds.shape[1],
-                dtype=torch.int32,
-                device=input_embeds.device,
-            )
+            patch_len = tgt_sizes[:, 0] * tgt_sizes[:, 1]
         else:
-            raise ValueError(
-                "Either `tgt_sizes` or `input_embeds` must be provided to compute cu_seqlens."
-            )
+            patch_len = atch_attention_mask[:, :, 0].sum(dim=1) * atch_attention_mask[
+                :, 0, :
+            ].sum(dim=1)
 
         cu_seqlens = torch.cat(
             [
-                torch.tensor([0], device=seqlen.device, dtype=torch.int32),
-                torch.cumsum(seqlen, dim=0, dtype=torch.int32),
+                torch.tensor([0], device=patch_len.device, dtype=torch.int32),
+                torch.cumsum(patch_len, dim=0, dtype=torch.int32),
             ],
             dim=0,
-        ).to(seqlen.device)
+        ).to(patch_len.device)
         return cu_seqlens
 
     def forward(
@@ -333,7 +326,7 @@ class Idefics2VisionTransformer(nn.Module):
             patch_attention_mask=patch_attention_mask,
             tgt_sizes=tgt_sizes,
         )
-        cu_seqlens = self.compute_cu_seqlens(tgt_sizes, hidden_states)
+        cu_seqlens = self.compute_cu_seqlens(tgt_sizes, patch_attention_mask)
         encoder_outputs = self.encoder(
             hidden_states,
             cu_seqlens=cu_seqlens,

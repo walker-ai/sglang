@@ -98,12 +98,11 @@ def initialize_dp_attention(
         ],
         local_rank,
         torch.distributed.get_backend(tp_group.device_group),
-        use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP,
-        use_pymscclpp=False,
-        use_custom_allreduce=False,
-        use_hpu_communicator=False,
-        use_xpu_communicator=False,
-        use_npu_communicator=False,
+        SYNC_TOKEN_IDS_ACROSS_TP,
+        False,
+        False,
+        False,
+        False,
         group_name="attention_tp",
     )
 

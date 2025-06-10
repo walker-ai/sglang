@@ -28,7 +28,6 @@ from xgrammar import (
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
-    INVALID_GRAMMAR_OBJ,
     BaseGrammarBackend,
     BaseGrammarObject,
 )
@@ -153,11 +152,10 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     ):
         super().__init__()
 
-        if True:
-            tokenizer_info = TokenizerInfo.from_huggingface(
-                tokenizer, vocab_size=vocab_size
-            )
-            override_stop_tokens = None
+        tokenizer_info = TokenizerInfo.from_huggingface(
+            tokenizer, vocab_size=vocab_size
+        )
+        override_stop_tokens = None
 
         self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
         self.vocab_size = vocab_size
@@ -180,26 +178,25 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 ctx = self.grammar_compiler.compile_builtin_json_grammar()
             else:
                 ctx = self.grammar_compiler.compile_json_schema(schema=key_string)
-
-        except (RuntimeError, json.decoder.JSONDecodeError) as e:
-            logging.error(f"Hit invalid json_schema: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+        except RuntimeError as e:
+            logging.warning(f"Skip invalid json_schema: json_schema={key_string}, {e=}")
+            return None
         return self._from_context(ctx, key_string)
 
     def dispatch_ebnf(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
             ctx = self.grammar_compiler.compile_grammar(key_string)
         except RuntimeError as e:
-            logging.error(f"Hit invalid ebnf: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            logging.warning(f"Skip invalid ebnf: ebnf={key_string}, {e=}")
+            return None
         return self._from_context(ctx, key_string)
 
     def dispatch_regex(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
             ctx = self.grammar_compiler.compile_regex(key_string)
         except RuntimeError as e:
-            logging.error(f"Hit invalid regex: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            logging.warning(f"Skip invalid regex: regex={key_string}, {e=}")
+            return None
         return self._from_context(ctx, key_string)
 
     def dispatch_structural_tag(self, key_string: str) -> Optional[XGrammarGrammar]:
@@ -216,10 +213,13 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             ctx = self.grammar_compiler.compile_structural_tag(
                 tags, structural_tag["triggers"]
             )
-        except (RuntimeError, json.decoder.JSONDecodeError) as e:
-            logging.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+        except RuntimeError as e:
+            logging.warning(
+                f"Skip invalid structural_tag: structural_tag={key_string}, {e=}"
+            )
+            return None
         return self._from_context(ctx, key_string)
 
     def reset(self):
-        self.grammar_compiler.clear_cache()
+        if self.grammar_compiler:
+            self.grammar_compiler.clear_cache()

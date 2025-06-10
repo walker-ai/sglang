@@ -28,7 +28,6 @@ from llguidance.torch import (
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
-    INVALID_GRAMMAR_OBJ,
     BaseGrammarBackend,
     BaseGrammarObject,
 )
@@ -127,8 +126,8 @@ class GuidanceBackend(BaseGrammarBackend):
                 serialized_grammar=serialized_grammar,
             )
         except Exception as e:
-            logger.error(f"Hit invalid grammar: {serialized_grammar=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            logger.warning(f"Skip invalid grammar: {serialized_grammar}, {e=}")
+            return None
 
     def dispatch_json(self, key_string: str) -> Optional[GuidanceGrammar]:
         try:
@@ -139,8 +138,8 @@ class GuidanceBackend(BaseGrammarBackend):
                 },
             )
         except Exception as e:
-            logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            logger.warning(f"Skip invalid grammar: {key_string=}, {e=}")
+            return None
         return self._from_serialized(serialized_grammar)
 
     def dispatch_regex(self, key_string: str) -> Optional[GuidanceGrammar]:
@@ -152,8 +151,8 @@ class GuidanceBackend(BaseGrammarBackend):
             serialized_grammar = grammar_from("ebnf", key_string)
             return self._from_serialized(serialized_grammar)
         except ValueError as e:
-            logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            logger.warning(f"Skip invalid ebnf: regex={key_string}, {e=}")
+            return None
 
     def dispatch_structural_tag(self, key_string: str) -> Optional[GuidanceGrammar]:
         try:
@@ -170,5 +169,5 @@ class GuidanceBackend(BaseGrammarBackend):
             g = StructTag.to_grammar(tags)
             return self._from_serialized(g)
         except Exception as e:
-            logging.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
-            return INVALID_GRAMMAR_OBJ
+            logging.warning(f"Skip invalid structural_tag: {key_string}, {e=}")
+            return None

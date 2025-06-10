@@ -18,7 +18,7 @@ from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
 )
 
 
-def get_model_config(model_name: str, tp_size: int):
+def get_model_config(model_name: str, tp_size: int, n_share_experts_fusion: int = 0):
     """Get model configuration parameters"""
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
 
@@ -43,8 +43,9 @@ def get_model_config(model_name: str, tp_size: int):
         intermediate_size = config.moe_intermediate_size
         shard_intermediate_size = 2 * intermediate_size // tp_size
     elif config.architectures[0] in ["DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"]:
+        n_share_fusion_experts = n_share_experts_fusion
         E = (
-            config.n_routed_experts + 1
+            config.n_routed_experts + n_share_fusion_experts
             if config.architectures[0] in ["DeepseekV3ForCausalLM"]
             else config.n_routed_experts
         )
@@ -293,6 +294,7 @@ def main():
         "--model", type=str, default="mistralai/Mixtral-8x7B-Instruct-v0.1"
     )
     parser.add_argument("--tp-size", type=int, default=2)
+    parser.add_argument("--n-share-experts-fusion", type=int, default=0)
     parser.add_argument("--use-fp8-w8a8", action="store_true")
     parser.add_argument(
         "--save-path",
@@ -323,7 +325,9 @@ def main():
             pipeline_model_parallel_size=1,
         )
 
-        model_config = get_model_config(args.model, args.tp_size)
+        model_config = get_model_config(
+            args.model, args.tp_size, args.n_share_experts_fusion
+        )
         benchmark.run(
             show_plots=True,
             print_data=True,

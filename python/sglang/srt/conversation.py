@@ -562,11 +562,14 @@ def generate_chat_conv(
                     if content.type == "image_url":
                         num_image_url += 1
                         conv.modalities.append(content.modalities)
-                image_token = (
-                    conv.image_token + "\n"
-                    if conv.name != "qwen2-vl"
-                    else conv.image_token
-                )
+                if num_image_url > 1:
+                    image_token = conv.image_token
+                else:
+                    image_token = (
+                        conv.image_token + "\n"
+                        if conv.name != "qwen2-vl"
+                        else conv.image_token
+                    )
                 add_token_as_needed: bool = (
                     conv.name in _MODELS_REQUIRING_MODALITY_SUPPLEMENT
                 )
@@ -677,8 +680,8 @@ register_conv_template(
 register_conv_template(
     Conversation(
         name="phi-4-mm",
-        system_message="",
-        system_template="{system_message}",
+        system_message="You are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.",
+        system_template="<|system|>{system_message}<|end|>",
         roles=("<|user|>", "<|assistant|>"),
         sep_style=SeparatorStyle.NO_COLON_SINGLE,
         sep="<|end|>",

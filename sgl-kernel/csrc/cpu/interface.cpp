@@ -33,11 +33,11 @@ void initialize(int64_t size, int64_t rank) {
   world_rank = rank;
   is_initialized = true;
 
-  const char* addr_string = std::getenv("MASTER_ADDR");
+  auto addr_string = std::getenv("MASTER_ADDR");
   if (addr_string == NULL) {
     addr_string = "";
   }
-  const char* port_string = std::getenv("MASTER_PORT");
+  auto port_string = std::getenv("MASTER_PORT");
   if (port_string == NULL) {
     port_string = "";
   }

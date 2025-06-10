@@ -60,7 +60,7 @@ class BaseGrammarObject:
         raise NotImplementedError()
 
     def copy(self) -> "BaseGrammarObject":
-        return self
+        raise NotImplementedError()
 
     @property
     def finished(self):
@@ -99,12 +99,9 @@ class BaseGrammarObject:
         raise NotImplementedError()
 
 
-INVALID_GRAMMAR_OBJ = BaseGrammarObject()
-
-
 @dataclass
 class CacheEntry:
-    value: BaseGrammarObject
+    value: Optional[BaseGrammarObject]
     event: Event
 
 
