@@ -7,7 +7,6 @@ from sglang.srt.configs.kimi_vl import KimiVLConfig
 from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
 
 from sglang.srt.configs.glm import GLMConfig
-from sglang.srt.configs.bailing_moe_config import BailingMoEConfig
 
 __all__ = [
     "ExaoneConfig",
@@ -18,5 +17,4 @@ __all__ = [
     "KimiVLConfig",
     "MoonViTConfig",
     "GLMConfig",
-    "BailingMoEConfig",
 ]

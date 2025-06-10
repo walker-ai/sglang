@@ -40,7 +40,6 @@ from sglang.srt.configs import (
     KimiVLConfig,
     MultiModalityConfig,
     GLMConfig,
-    BailingMoEConfig,
 )
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.connector import create_remote_connector
@@ -55,7 +54,6 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     KimiVLConfig.model_type: KimiVLConfig,
     InternVLChatConfig.model_type: InternVLChatConfig,
     GLMConfig.model_type: GLMConfig,
-    BailingMoEConfig.model_type: BailingMoEConfig,
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
