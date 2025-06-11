@@ -22,7 +22,7 @@
 The input of the model is flattened to a 1D tensor of tokens. The model uses
 InputMetadata to extract the original 2D shape of the input.
 """
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import logging
 import torch
@@ -32,6 +32,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
     parallel_state,
+    get_pp_group,
 )
 
 from transformers import PretrainedConfig
@@ -55,6 +56,7 @@ from sglang.srt.layers.moe.topk import select_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import (
@@ -615,20 +617,24 @@ class BailingMoEModel(nn.Module):
         prefix: str = ""
     ):
         super().__init__()
+        self.pp_group = get_pp_group()
         self.config = config
         self.vocab_size = config.vocab_size
         self.embed_dim = config.hidden_size
-        self.word_embeddings = VocabParallelEmbedding(
-            self.vocab_size,
-            self.embed_dim,
-            quant_config=quant_config,
-            prefix=add_prefix("word_embeddings", prefix),
-            enable_tp=not global_server_args_dict["enable_dp_attention"],
-        )
+        if self.pp_group.is_first_rank:
+            self.word_embeddings = VocabParallelEmbedding(
+                self.vocab_size,
+                self.embed_dim,
+                quant_config=quant_config,
+                prefix=add_prefix("word_embeddings", prefix),
+                enable_tp=not global_server_args_dict["enable_dp_attention"],
+            )
+        else:
+            self.word_embeddings = PPMissingLayer()
 
         self.embedding_dropout = torch.nn.Dropout(config.embedding_dropout)
 
-        self.layers = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: BailingMoEBlock(
                 layer_id=idx,
@@ -636,10 +642,14 @@ class BailingMoEModel(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix
             ),
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
         )
-
-        self.norm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps)
+        if self.pp_group.is_last_rank:
+            self.norm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer(return_tuple=True)
 
     def forward(
         self,
@@ -647,14 +657,20 @@ class BailingMoEModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
-    ) -> torch.Tensor:
-        if input_embeds is None:
-            hidden_states = self.word_embeddings(input_ids)
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[torch.Tensor, PPProxyTensors]:
+        if self.pp_group.is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.word_embeddings(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = None
         else:
-            hidden_states = input_embeds
+            assert pp_proxy_tensors is not None
+            hidden_states = pp_proxy_tensors["hidden_states"]
+            residual = pp_proxy_tensors["residual"]
 
-        residual = None
-        for i in range(len(self.layers)):
+        for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 layer = self.layers[i]
                 hidden_states, residual = layer(
@@ -663,13 +679,20 @@ class BailingMoEModel(nn.Module):
                     forward_batch,
                     residual,
                 )
-
-        if not forward_batch.forward_mode.is_idle():
-            if residual is None:
-                hidden_states = self.norm(hidden_states)
-            else:
-                hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        if not self.pp_group.is_last_rank:
+            return PPProxyTensors(
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                }
+            )
+        else:
+            if not forward_batch.forward_mode.is_idle():
+                if residual is None:
+                    hidden_states = self.norm(hidden_states)
+                else:
+                    hidden_states, _ = self.norm(hidden_states, residual)
+            return hidden_states
 
 
 class BailingMoEForCausalLM(nn.Module):
@@ -680,6 +703,7 @@ class BailingMoEForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
         self.model = BailingMoEModel(config, quant_config, prefix=add_prefix("model", ""),)
@@ -707,6 +731,14 @@ class BailingMoEForCausalLM(nn.Module):
             )
             self.logits_processor = LogitsProcessor(config)
 
+    @property
+    def start_layer(self):
+        return self.model.start_layer
+
+    @property
+    def end_layer(self):
+        return self.model.end_layer
+
     @torch.no_grad()
     def forward(
         self,
@@ -714,11 +746,19 @@ class BailingMoEForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        hidden_states = self.model(input_ids,
+                                   positions,
+                                   forward_batch,
+                                   input_embeds,
+                                   pp_proxy_tensors=pp_proxy_tensors)
+        if self.pp_group.is_last_rank:
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch
+            )
+        else:
+            return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -805,7 +845,7 @@ class BailingMoEForCausalLM(nn.Module):
         self.routed_experts_weights_of_layer = {
             layer_id: layer.mlp.get_moe_weights()
             for layer_id, layer in enumerate(self.model.layers)
-            if isinstance(layer.mlp, BailingMoESparseMoeBlock)
+            if not isinstance(layer, PPMissingLayer) and isinstance(layer.mlp, BailingMoESparseMoeBlock)
         }
 
     @classmethod
