@@ -62,6 +62,7 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 
+ENABLE_WEIGHTS_PREFETCH = get_bool_env_var("SGLANG_ENABLE_WEIGHTS_PREFETCH", "true")
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module, target_device: torch.device):
@@ -338,11 +339,11 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
-            if self.load_config.load_format == LoadFormat.PREFETCH_AUTO:
+            if ENABLE_WEIGHTS_PREFETCH or self.load_config.load_format == LoadFormat.PREFETCH_AUTO:
                 prefetch_weight_files(hf_weights_files)
             weights_iterator = safetensors_weights_iterator(hf_weights_files)
         else:
-            if self.load_config.load_format == LoadFormat.PREFETCH_AUTO:
+            if ENABLE_WEIGHTS_PREFETCH or self.load_config.load_format == LoadFormat.PREFETCH_AUTO:
                 prefetch_weight_files(hf_weights_files)
             weights_iterator = pt_weights_iterator(hf_weights_files)
 
