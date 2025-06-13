@@ -460,6 +460,8 @@ def prefetch_weight_files(hf_weights_files: List[str]) -> None:
         torch.distributed.barrier()
 
 def mmap_files_concurrently(hf_weights_files: List[str]) -> None:
+    if len(hf_weights_files) == 0:
+        return
     max_workers = min(32, len(hf_weights_files))
     start_time = time.time()
     logger.info(f"Mmaping {len(hf_weights_files)} files concurrently")
