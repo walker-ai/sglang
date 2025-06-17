@@ -315,7 +315,7 @@ class BailingMoESparseMoeBlock(nn.Module):
             hidden_states=hidden_states, router_logits=router_logits
         )
 
-        final_hidden_states *= self.routed_scaling_factor
+        # final_hidden_states *= self.routed_scaling_factor
 
         if self.num_shared_experts > 0:
             final_hidden_states = final_hidden_states + shared_output
