@@ -886,10 +886,11 @@ class BailingMoEForCausalLM(nn.Module):
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
+        num_groups = getattr(config, "n_group", 0)
         return ModelConfigForExpertLocation(
             num_layers=config.num_hidden_layers,
             num_logical_experts=config.num_experts,
-            num_groups=None,
+            num_groups= None if num_groups == 0 else num_groups,
         )
 
 
