@@ -75,6 +75,9 @@ from sglang.srt.openai_api.protocol import (
     ToolCall,
     TopLogprob,
     UsageInfo,
+    TokenizeCompletionRequest,
+    TokenizeChatRequest,
+    TokenizeResponse,
 )
 from sglang.srt.openai_api.utils import (
     detect_template_content_format,
@@ -1849,6 +1852,57 @@ async def v1_chat_completions(
 
     return response
 
+
+async def v1_tokenize(
+    tokenizer_manager, raw_request: Request
+):
+    try:
+        request_json = await raw_request.json()
+    except Exception as e:
+        return create_error_response("Invalid request body, error: ", str(e))
+    # 外部传入trace_id
+    prompt_ids = []
+
+    if request_json.get("messages", None):
+        request = TokenizeChatRequest(**request_json)
+        # process messages
+        openai_compatible_messages = []
+        for message in request.messages:
+            if message.content is None:
+                message.content = ""
+            msg_dict = message.dict()
+            if isinstance(msg_dict.get("content"), list):
+                for chunk in msg_dict["content"]:
+                    if isinstance(chunk, dict) and chunk.get("type") == "text":
+                        new_msg = msg_dict.copy()
+                        new_msg["content"] = chunk["text"]
+                        new_msg = {
+                            k: v for k, v in new_msg.items() if v is not None
+                        }
+                        openai_compatible_messages.append(new_msg)
+            else:
+                msg_dict = {k: v for k, v in msg_dict.items() if v is not None}
+                openai_compatible_messages.append(msg_dict)
+        prompt_ids = tokenizer_manager.tokenizer.apply_chat_template(
+            openai_compatible_messages,
+            tokenize=True,
+            add_generation_prompt=request.add_generation_prompt,
+            continue_final_message=request.continue_final_message,
+            **(
+                request.chat_template_kwargs
+                if request.chat_template_kwargs
+                else {}
+            ),
+        )
+    else:
+        request = TokenizeCompletionRequest(**request_json)
+        prompt_ids = tokenizer_manager.tokenizer.encode(
+            request.prompt,
+            add_special_tokens=request.add_special_tokens,
+        )
+    return TokenizeResponse(tokens=prompt_ids,
+                            count=len(prompt_ids),
+                            max_model_len=tokenizer_manager.context_len)
 
 def v1_embedding_request(all_requests, tokenizer_manager):
     prompts = []

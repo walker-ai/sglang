@@ -83,6 +83,7 @@ from sglang.srt.openai_api.adapter import (
     v1_retrieve_file,
     v1_retrieve_file_content,
     v1_score,
+    v1_tokenize,
 )
 from sglang.srt.openai_api.protocol import ModelCard, ModelList
 from sglang.srt.reasoning_parser import ReasoningParser
@@ -616,6 +617,11 @@ async def openai_v1_completions(raw_request: Request):
 @app.post("/v1/chat/completions")
 async def openai_v1_chat_completions(raw_request: Request):
     return await v1_chat_completions(_global_state.tokenizer_manager, raw_request)
+
+
+@app.post("/tokenize")
+async def openai_v1_tokenize(raw_request: Request):
+    return await v1_tokenize(_global_state.tokenizer_manager, raw_request)
 
 
 @app.post("/v1/embeddings", response_class=ORJSONResponse)
