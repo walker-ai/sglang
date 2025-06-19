@@ -788,12 +788,25 @@ class Req:
     def set_finish_with_abort(self, error_msg: str):
         if get_tensor_model_parallel_rank() == 0:
             logger.error(f"{error_msg}, {self.rid=}")
-        self.multimodal_inputs = None
+        self.release_mm_resources()
         self.grammar = None
         self.origin_input_ids = [0]  # set it to one token to skip the long prefill
         self.finished_reason = FINISH_ABORT(
             error_msg, HTTPStatus.BAD_REQUEST, "BadRequestError"
         )
+
+    def release_mm_resources(self):
+        if self.multimodal_inputs and self.multimodal_inputs.mm_items:
+            for mm_item in self.multimodal_inputs.mm_items:
+                if mm_item is None:
+                    continue
+                # TODO(yudian.zy): 暂时删除了图像类的，后续要加入语音视频等
+                pixel_values = getattr(mm_item, "pixel_values", None)
+                if not isinstance(pixel_values, torch.Tensor):
+                    continue
+                del mm_item.pixel_values
+            del self.multimodal_inputs.mm_items
+        self.multimodal_inputs = None
 
     def __repr__(self):
         return (
