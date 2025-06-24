@@ -298,6 +298,7 @@ class SchedulerMetricsCollector:
 
 
 class TokenizerMetricsCollector:
+
     def __init__(
         self,
         labels: Dict[str, str],
@@ -408,6 +409,12 @@ class TokenizerMetricsCollector:
             labelnames=labels.keys(),
         )
 
+        self.counter_request_success = Counter(
+            name="sglang:request_success_total",
+            documentation="Count of successfully processed requests.",
+            labelnames=list(labels.keys()) + ["finished_reason"],
+        )
+
         if bucket_time_to_first_token is None:
             bucket_time_to_first_token = [
                 0.1,
@@ -511,6 +518,7 @@ class TokenizerMetricsCollector:
         cached_tokens: int,
         e2e_latency: float,
         has_grammar: bool,
+        finished_reason: str,
     ):
         self.prompt_tokens_total.labels(**self.labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**self.labels).inc(generation_tokens)
@@ -519,6 +527,9 @@ class TokenizerMetricsCollector:
         self.num_requests_total.labels(**self.labels).inc(1)
         if has_grammar:
             self.num_so_requests_total.labels(**self.labels).inc(1)
+        self.counter_request_success.labels(
+            **self.labels, finished_reason=finished_reason
+        ).inc(1)
         self._log_histogram(self.histogram_e2e_request_latency, e2e_latency)
         if self.collect_tokens_histogram:
             self._log_histogram(self.prompt_tokens_histogram, prompt_tokens)

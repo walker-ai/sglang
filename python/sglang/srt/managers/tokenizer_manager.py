@@ -142,6 +142,7 @@ class ReqState:
     first_token_time: float = 0.0
     last_time: float = 0.0
     last_completion_tokens: int = 1
+    finish_reason: str = ""
 
     # For streaming output
     last_output_offset: int = 0
@@ -1226,6 +1227,7 @@ class TokenizerManager:
                     meta_info["spec_verify_ct"] = recv_obj.spec_verify_ct[i]
                 state.finished_time = time.time()
                 meta_info["e2e_latency"] = state.finished_time - state.created_time
+                state.finish_reason = recv_obj.finished_reasons[i]["type"]
                 del self.rid_to_state[rid]
 
             state.out_list.append(out_dict)
@@ -1397,6 +1399,7 @@ class TokenizerManager:
                 recv_obj.cached_tokens[i],
                 state.finished_time - state.created_time,
                 has_grammar,
+                state.finish_reason,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
