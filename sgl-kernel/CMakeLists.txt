@@ -313,6 +313,7 @@ set(SGL_SAGE_KERNEL_CUDA_FLAGS
 set(SAGE_SOURCES
     "csrc/sage_extension.cc"
     "${repo-sage-attention_SOURCE_DIR}/csrc/fused/fused.cu"
+    "${repo-sage-attention_SOURCE_DIR}/csrc/qattn/qk_int_sv_f8_cuda_sm90.cu"
 )
 
 Python_add_library(sage_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SAGE_SOURCES})
