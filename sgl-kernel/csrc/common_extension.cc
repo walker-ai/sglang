@@ -274,7 +274,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "bool is_causal, float softcap, bool return_softmax, "
       "Generator? gen) -> Tensor[]");
   m.impl("varlen_fwd_sparse", torch::kCUDA, &flash::mha_varlen_fwd_sparse);
-
+  
   // Sparse Attention utils
   m.def(
       "convert_vertical_slash_indexes("
