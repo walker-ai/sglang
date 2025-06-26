@@ -18,20 +18,15 @@ limitations under the License.
 
 #include "sgl_sage_kernel_ops.h"
 
-void quant_per_block_int8_cuda(
-            torch::Tensor input,
-            torch::Tensor output,
-            torch::Tensor scale,
-            float sm_scale,
-            int block_size,
-            int tensor_layout);
-
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   /*
    * From sage-attention
    */
 
   // from fused
+
+  using QuantFuncV1 = void(*)(torch::Tensor, torch::Tensor, torch::Tensor, float, int, int);
+  using QuantFuncV2 = void(*)(torch::Tensor, torch::Tensor, torch::Tensor, int, int);
   m.def(
       "quant_per_block_int8_cuda(Tensor input,"
                                 "Tensor output,"
@@ -39,7 +34,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
                                 "float sm_scale,"
                                 "int block_size,"
                                 "int tensor_layout) -> ()");
-  m.impl("quant_per_block_int8_cuda", torch::kCUDA, make_pytorch_shim(&quant_per_block_int8_cuda));
+  m.impl("quant_per_block_int8_cuda", torch::kCUDA, make_pytorch_shim(static_cast<QuantFuncV1>(&quant_per_block_int8_cuda)));
 
   m.def(
       "quant_per_block_int8_cuda(Tensor input,"
@@ -47,7 +42,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
                                 "Tensor scale,"
                                 "int block_size,"
                                 "int tensor_layout) -> ()");
-  m.impl("quant_per_block_int8_cuda", torch::kCUDA, make_pytorch_shim(&quant_per_block_int8_cuda));
+  m.impl("quant_per_block_int8_cuda", torch::kCUDA, make_pytorch_shim(static_cast<QuantFuncV2>(&quant_per_block_int8_cuda)));
 
   m.def(
       "quant_per_block_int8_fuse_sub_mean_cuda(Tensor input,"
