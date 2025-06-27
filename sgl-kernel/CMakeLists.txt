@@ -303,7 +303,7 @@ set(SGL_SAGE_KERNEL_CUDA_FLAGS
     "-std=c++17"
     "-U__CUDA_NO_HALF_OPERATORS__"
     "-U__CUDA_NO_HALF_CONVERSIONS__"
-    "-gencode=arch=compute_90,code=sm_90a"
+    "-gencode=arch=compute_90a,code=sm_90a"
     "--use_fast_math"
     "--threads=8"
     "-Xptxas=-v"
