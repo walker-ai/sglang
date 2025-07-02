@@ -43,7 +43,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "quant_per_block_int8_fuse_sub_mean_cuda(Tensor input,"
-                                              "Tensor output,"
                                               "Tensor mean,"
                                               "Tensor output,"
                                               "Tensor scale,"
