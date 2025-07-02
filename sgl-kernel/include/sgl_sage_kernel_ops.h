@@ -44,7 +44,7 @@ limitations under the License.
  */
 
 // from fused
-void quant_per_block_int8_cuda(
+void quant_per_block_int8_cuda_with_sm_scale(
                 torch::Tensor input,
                 torch::Tensor output,
                 torch::Tensor scale,

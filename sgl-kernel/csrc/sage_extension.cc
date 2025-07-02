@@ -24,17 +24,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    */
 
   // from fused
-
-  using QuantFuncV1 = void(*)(torch::Tensor, torch::Tensor, torch::Tensor, float, int, int);
-  using QuantFuncV2 = void(*)(torch::Tensor, torch::Tensor, torch::Tensor, int, int);
   m.def(
-      "quant_per_block_int8_cuda(Tensor input,"
+      "quant_per_block_int8_cuda_with_sm_scale(Tensor input,"
                                 "Tensor output,"
                                 "Tensor scale,"
                                 "float sm_scale,"
                                 "int block_size,"
                                 "int tensor_layout) -> ()");
-  m.impl("quant_per_block_int8_cuda", torch::kCUDA, make_pytorch_shim(static_cast<QuantFuncV1>(&quant_per_block_int8_cuda)));
+  m.impl("quant_per_block_int8_cuda_with_sm_scale", torch::kCUDA, make_pytorch_shim(&quant_per_block_int8_cuda_with_sm_scale));
 
   m.def(
       "quant_per_block_int8_cuda(Tensor input,"
@@ -42,7 +39,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
                                 "Tensor scale,"
                                 "int block_size,"
                                 "int tensor_layout) -> ()");
-  m.impl("quant_per_block_int8_cuda", torch::kCUDA, make_pytorch_shim(static_cast<QuantFuncV2>(&quant_per_block_int8_cuda)));
+  m.impl("quant_per_block_int8_cuda", torch::kCUDA, make_pytorch_shim(&quant_per_block_int8_cuda));
 
   m.def(
       "quant_per_block_int8_fuse_sub_mean_cuda(Tensor input,"
