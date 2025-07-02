@@ -1029,6 +1029,7 @@ class ServerArgs:
                 "aiter",
                 "cutlass_mla",
                 "fa3",
+                "sa",
                 "flashinfer",
                 "flashmla",
                 "intel_amx",
