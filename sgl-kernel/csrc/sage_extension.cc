@@ -56,7 +56,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
                                "Tensor output,"
                                "Tensor scale,"
                                "int block_size,"
-                               "int warp_blocK_size,"
+                               "int warp_block_size,"
                                "int tensor_layout) -> ()");
   m.impl("quant_per_warp_int8_cuda", torch::kCUDA, make_pytorch_shim(&quant_per_warp_int8_cuda));
 
