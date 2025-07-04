@@ -70,9 +70,6 @@ class SageAttentionBackend(AttentionBackend):
         self,
         model_runner,
         skip_prefill: bool = False,
-        speculative_step_id=0,
-        topk=0,
-        speculative_num_steps=0,
     ):
         super().__init__()
 
