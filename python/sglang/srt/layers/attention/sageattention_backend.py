@@ -229,6 +229,9 @@ class SageAttentionBackend(AttentionBackend):
             #     forward_batch.batch_size, -1, layer.tp_v_head_num, layer.head_dim
             # )
 
+            k = key_cache[1:cache_loc+1, :, :]
+            v = value_cache[1:cache_loc+1, :, :]
+
             k = k.view(
                 forward_batch.batch_size, -1, layer.tp_k_head_num, layer.head_dim
             )
