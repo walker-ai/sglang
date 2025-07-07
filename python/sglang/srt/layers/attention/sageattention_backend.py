@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from sgl_kernel import sageattn
+from sgl_kernel.sage_attn import sageattn
 
 @dataclass
 class SageAttentionMetadata:
@@ -81,6 +81,8 @@ class SageAttentionBackend(AttentionBackend):
         self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.skip_prefill = skip_prefill
 
+        self.use_mla = False
+
         # Local attention settings
         self.attention_chunk_size = (
             model_runner.attention_chunk_size
@@ -99,43 +101,15 @@ class SageAttentionBackend(AttentionBackend):
             # TODO(walker-ai): currently not support speculative decoding, Normal Decode
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
-            metadata.cu_seqlens_q = torch.arange(
-                0, batch_size + 1, dtype=torch.int32, device=device
-            )
-            metadata.cu_seqlens_k = torch.nn.functional.pad(
-                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
-            )
-            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, : metadata.max_seq_len_k
-            ]
 
-            self._init_local_attn_metadata(metadata, device)
+            # self._init_local_attn_metadata(metadata, device)
         elif forward_batch.forward_mode.is_extend():
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
-            metadata.cu_seqlens_k = torch.nn.functional.pad(
-                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
-            )
-            metadata.page_table = forward_batch.req_to_token_pool.req_to_token[
-                forward_batch.req_pool_indices, : metadata.max_seq_len_k
-            ]
-
-            if (
-                any(forward_batch.extend_prefix_lens_cpu)
-                or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
-            ):
-                extend_seq_lens = forward_batch.extend_seq_lens
-                metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
-                metadata.cu_seqlens_q = torch.nn.functional.pad(
-                    torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
-                )
-            else:
-                metadata.max_seq_len_q = metadata.max_seq_len_k
-                metadata.cu_seqlens_q = metadata.cu_seqlens_k
-            
+ 
             # Setup local attention if enabled
-            if forward_batch.forward_mode == ForwardMode.EXTEND:
-                self._init_local_attn_metadata(metadata, device)
+            # if forward_batch.forward_mode == ForwardMode.EXTEND:
+            #     self._init_local_attn_metadata(metadata, device)
 
         self.forward_metadata = metadata
         
@@ -174,24 +148,35 @@ class SageAttentionBackend(AttentionBackend):
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
-            key_cache = key_cache.view(
-                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+
+            q = q.view(
+                forward_batch.batch_size, -1, layer.tp_q_head_num, layer.head_dim
             )
-            value_cache = value_cache.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+
+            k = k.view(
+                forward_batch.batch_size, -1, layer.tp_k_head_num, layer.head_dim
             )
+
+            v= v.view(
+                forward_batch.batch_size, -1, layer.tp_v_head_num, layer.head_dim
+            )
+
+            # key_cache = key_cache.view(
+            #     -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            # )
+            # value_cache = value_cache.view(
+            #     -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+            # )
             
             result = sageattn(
                 q=q,
-                k=key_cache,
-                v=value_cache,
-                is_causal=False if use_cascade_attn else causal,
+                k=k,
+                v=v,
+                is_causal=True,
             )
 
-            if use_cascade_attn:
-                raise NotImplementedError("SageAttention doesn't support use_cascade_attn currently.")
-            else:
-                o = result
+         
+            o = result
 
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             
@@ -237,22 +222,32 @@ class SageAttentionBackend(AttentionBackend):
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
-            key_cache = key_cache.view(
-                -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+            # key_cache = key_cache.view(
+            #     forward_batch.batch_size, -1, layer.tp_k_head_num, layer.head_dim
+            # )
+            # value_cache = value_cache.view(
+            #     forward_batch.batch_size, -1, layer.tp_v_head_num, layer.head_dim
+            # )
+
+            k = k.view(
+                forward_batch.batch_size, -1, layer.tp_k_head_num, layer.head_dim
             )
-            value_cache = value_cache.view(
-                -1, self.page_size, layer.tp_v_head_num, layer.head_dim
+
+            v = v.view(
+                forward_batch.batch_size, -1, layer.tp_k_head_num, layer.head_dim
             )
 
             q_reshaped = q.contiguous().view(
-                -1, layer.tp_q_head_num, layer.head_dim
+                forward_batch.batch_size, -1, layer.tp_q_head_num, layer.head_dim
             )
 
             # Default: single-token self-attention
             result = sageattn(
                 q=q_reshaped,
-                k_cache=key_cache,
-                v_cache=value_cache,
+                k=k,
+                v=v,
+                # k_cache=key_cache[:, :cache_loc, :, :],
+                # v_cache=value_cache[:, :cache_loc, :, :],
             )
 
             o = result

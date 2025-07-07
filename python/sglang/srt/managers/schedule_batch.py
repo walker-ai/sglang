@@ -1662,6 +1662,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Create seq_lens_cpu when needed
         if (
             global_server_args_dict["attention_backend"] == "fa3"
+            or global_server_args_dict["attention_backend"] == "sa"  # 需要cpu端端序列长度，是一种加速手段
             or (
                 global_server_args_dict["use_mla_backend"]
                 and global_server_args_dict["attention_backend"] == "flashinfer"
