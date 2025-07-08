@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-from sgl_kernel.sage_attn import sageattn
+from sgl_kernel.sage_attn import sageattn, sageattn_varlen
 
 @dataclass
 class SageAttentionMetadata:
@@ -105,8 +105,16 @@ class SageAttentionBackend(AttentionBackend):
             # self._init_local_attn_metadata(metadata, device)
         elif forward_batch.forward_mode.is_extend():
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+            
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
- 
+            metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
+
+            metadata.cu_seqlens_k = = torch.nn.functional.pad(
+                torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+            )
+            metadata.cu_seqlens_q = meta.cu_seqlens_k
+            
+
             # Setup local attention if enabled
             # if forward_batch.forward_mode == ForwardMode.EXTEND:
             #     self._init_local_attn_metadata(metadata, device)
@@ -142,6 +150,12 @@ class SageAttentionBackend(AttentionBackend):
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
 
+        max_seq_len_q = metadata.max_seq_len_q
+        max_seq_len_k = metadata.max_seq_len_k
+        cu_seqlens_q = metadata.cu_seqlens_q
+        cu_seqlens_k = metadata.cu_seqlens_k
+
+
         # Use Sage Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
@@ -168,10 +182,14 @@ class SageAttentionBackend(AttentionBackend):
             #     -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             # )
             
-            result = sageattn(
+            result = sageattn_varlen(
                 q=q,
                 k=k,
                 v=v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seq_len_q=max_seq_len_q,
+                max_seq_len_k=max_seq_len_k,
                 is_causal=True,
             )
 
