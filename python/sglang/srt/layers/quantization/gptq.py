@@ -60,6 +60,12 @@ class GPTQConfig(QuantizationConfig):
     Reference: https://arxiv.org/abs/2210.17323
     """
 
+    # (num_bits, is_sym) -> quant_type
+    TYPE_MAP = {
+        (4, True): scalar_types.uint4b8,
+        (8, True): scalar_types.uint8b128,
+    }
+
     def __init__(
         self,
         weight_bits: int,
@@ -98,12 +104,20 @@ class GPTQConfig(QuantizationConfig):
         self.group_size = group_size
         self.desc_act = desc_act
         self.lm_head_quantized = lm_head_quantized
+
+        # Need to figure out when to set GPTQConfig.is_sym to False
+        is_sym = True
+        self.is_sym = is_sym
+
         self.pack_factor = Fraction(32, self.weight_bits)
         if self.weight_bits not in [2, 3, 4, 8]:
             raise ValueError(
                 "Currently, only 2/3/4/8-bit weight quantization is "
                 f"supported for GPTQ, but got {self.weight_bits} bits."
             )
+            
+        # (num_bits, is_sym) -> quant_type
+        self.quant_type = self.TYPE_MAP[(weight_bits, is_sym)]
 
     def __repr__(self) -> str:
         return (
