@@ -199,17 +199,17 @@ class SageAttentionBackend(AttentionBackend):
                 layer.layer_id
             )
 
-            q = q.view(
-                forward_batch.batch_size, -1, layer.tp_q_head_num, layer.head_dim
-            )
+            # q = q.view(
+            #     forward_batch.batch_size, -1, layer.tp_q_head_num, layer.head_dim
+            # )
 
-            k = k.view(
-                forward_batch.batch_size, -1, layer.tp_k_head_num, layer.head_dim
-            )
+            # k = k.view(
+            #     forward_batch.batch_size, -1, layer.tp_k_head_num, layer.head_dim
+            # )
 
-            v= v.view(
-                forward_batch.batch_size, -1, layer.tp_v_head_num, layer.head_dim
-            )
+            # v= v.view(
+            #     forward_batch.batch_size, -1, layer.tp_v_head_num, layer.head_dim
+            # )
 
             # key_cache = key_cache.view(
             #     -1, self.page_size, layer.tp_k_head_num, layer.head_dim
@@ -218,35 +218,35 @@ class SageAttentionBackend(AttentionBackend):
             #     -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             # )
 
-            result = sageattn(
-                q=q,
-                k=k,
-                v=v,
-                is_causal=True,
-            )
-
-            # q = q.view(
-            #     cu_seqlens_q[-1], layer.tp_q_head_num, layer.head_dim
-            # )
-
-            # k = k.view(
-            #     cu_seqlens_k[-1], layer.tp_k_head_num, layer.head_dim
-            # )
-
-            # v= v.view(
-            #     cu_seqlens_v[-1], layer.tp_v_head_num, layer.head_dim
-            # )
-            
-            # result = sageattn_varlen(
+            # result = sageattn(
             #     q=q,
             #     k=k,
             #     v=v,
-            #     cu_seqlens_q=cu_seqlens_q,
-            #     cu_seqlens_k=cu_seqlens_k,
-            #     max_seqlen_q=max_seq_len_q,
-            #     max_seqlen_k=max_seq_len_k,
             #     is_causal=True,
             # )
+
+            q = q.view(
+                cu_seqlens_q[-1], layer.tp_q_head_num, layer.head_dim
+            )
+
+            k = k.view(
+                cu_seqlens_k[-1], layer.tp_k_head_num, layer.head_dim
+            )
+
+            v= v.view(
+                cu_seqlens_k[-1], layer.tp_v_head_num, layer.head_dim
+            )
+            
+            result = sageattn_varlen(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seq_len_q,
+                max_seqlen_k=max_seq_len_k,
+                is_causal=True,
+            )
 
          
             o = result
@@ -307,20 +307,20 @@ class SageAttentionBackend(AttentionBackend):
             #     forward_batch.batch_size, -1, layer.tp_v_head_num, layer.head_dim
             # )
 
-            # kv_indices_ref = torch.cat(
-            #     [
-            #         self.req_to_token[forward_batch.req_pool_indices[i], :forward_batch.seq_lens[i]] 
-            #         for i in range(forward_batch.batch_size)
-            #     ],
-            #     dim=0,
-            # ).contiguous()
+            kv_indices_ref = torch.cat(
+                [
+                    self.req_to_token[forward_batch.req_pool_indices[i], :forward_batch.seq_lens[i]] 
+                    for i in range(forward_batch.batch_size)
+                ],
+                dim=0,
+            ).contiguous()
 
 
-            # k = key_cache[kv_indices_ref, :, :]
-            # v = value_cache[kv_indices_ref, :, :]
+            k = key_cache[kv_indices_ref, :, :]
+            v = value_cache[kv_indices_ref, :, :]
 
-            k = key_cache[self.kv_indices, :, :]
-            v = value_cache[self.kv_indices, :, :]
+            # k = key_cache[self.kv_indices, :, :]
+            # v = value_cache[self.kv_indices, :, :]
 
             k = k.view(
                 cu_seqlens_k[-1], layer.tp_k_head_num, layer.head_dim
