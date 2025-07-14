@@ -8,10 +8,13 @@ import torch
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
 from sglang.srt.utils import get_compiler_backend
+
+
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -90,8 +93,18 @@ class SageAttentionBackend(AttentionBackend):
             else None
         )
 
+        max_bs = model_runner.req_to_token_pool.size
+        self.kv_indptr = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+        )
+
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
+
+        bs = forward_batch.batch_size
+        kv_indptr = self.kv_indptr
+
         metadata = SageAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
@@ -102,6 +115,29 @@ class SageAttentionBackend(AttentionBackend):
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
 
+            kv_indices = torch.empty(
+                forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
+            )
+
+            metadata.cu_seqlens_q = torch.arange(
+                0, batch_size + 1, dtype=torch.int32, device=device
+            )
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+            )
+
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+
+            self.kv_indices = kv_indices
+
             # self._init_local_attn_metadata(metadata, device)
         elif forward_batch.forward_mode.is_extend():
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
@@ -109,10 +145,10 @@ class SageAttentionBackend(AttentionBackend):
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
             metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
 
-            metadata.cu_seqlens_k = = torch.nn.functional.pad(
-                torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(forward_batch.extend_seq_lens, dim=0, dtype=torch.int32), (1, 0)
             )
-            metadata.cu_seqlens_q = meta.cu_seqlens_k
+            metadata.cu_seqlens_q = metadata.cu_seqlens_k
             
 
             # Setup local attention if enabled
@@ -181,17 +217,36 @@ class SageAttentionBackend(AttentionBackend):
             # value_cache = value_cache.view(
             #     -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             # )
-            
-            result = sageattn_varlen(
+
+            result = sageattn(
                 q=q,
                 k=k,
                 v=v,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seq_len_q=max_seq_len_q,
-                max_seq_len_k=max_seq_len_k,
                 is_causal=True,
             )
+
+            # q = q.view(
+            #     cu_seqlens_q[-1], layer.tp_q_head_num, layer.head_dim
+            # )
+
+            # k = k.view(
+            #     cu_seqlens_k[-1], layer.tp_k_head_num, layer.head_dim
+            # )
+
+            # v= v.view(
+            #     cu_seqlens_v[-1], layer.tp_v_head_num, layer.head_dim
+            # )
+            
+            # result = sageattn_varlen(
+            #     q=q,
+            #     k=k,
+            #     v=v,
+            #     cu_seqlens_q=cu_seqlens_q,
+            #     cu_seqlens_k=cu_seqlens_k,
+            #     max_seqlen_q=max_seq_len_q,
+            #     max_seqlen_k=max_seq_len_k,
+            #     is_causal=True,
+            # )
 
          
             o = result
@@ -234,6 +289,11 @@ class SageAttentionBackend(AttentionBackend):
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
 
+        max_seq_len_q = metadata.max_seq_len_q
+        max_seq_len_k = metadata.max_seq_len_k
+        cu_seqlens_q = metadata.cu_seqlens_q
+        cu_seqlens_k = metadata.cu_seqlens_k
+
         if not self.use_mla:
             # Do multi-head attention
 
@@ -247,28 +307,42 @@ class SageAttentionBackend(AttentionBackend):
             #     forward_batch.batch_size, -1, layer.tp_v_head_num, layer.head_dim
             # )
 
-            k = key_cache[1:cache_loc+1, :, :]
-            v = value_cache[1:cache_loc+1, :, :]
+            # kv_indices_ref = torch.cat(
+            #     [
+            #         self.req_to_token[forward_batch.req_pool_indices[i], :forward_batch.seq_lens[i]] 
+            #         for i in range(forward_batch.batch_size)
+            #     ],
+            #     dim=0,
+            # ).contiguous()
+
+
+            # k = key_cache[kv_indices_ref, :, :]
+            # v = value_cache[kv_indices_ref, :, :]
+
+            k = key_cache[self.kv_indices, :, :]
+            v = value_cache[self.kv_indices, :, :]
 
             k = k.view(
-                forward_batch.batch_size, -1, layer.tp_k_head_num, layer.head_dim
+                cu_seqlens_k[-1], layer.tp_k_head_num, layer.head_dim
             )
 
             v = v.view(
-                forward_batch.batch_size, -1, layer.tp_k_head_num, layer.head_dim
+                cu_seqlens_k[-1], layer.tp_k_head_num, layer.head_dim
             )
 
             q_reshaped = q.contiguous().view(
-                forward_batch.batch_size, -1, layer.tp_q_head_num, layer.head_dim
+                cu_seqlens_q[-1], layer.tp_q_head_num, layer.head_dim
             )
 
             # Default: single-token self-attention
-            result = sageattn(
+            result = sageattn_varlen(
                 q=q_reshaped,
                 k=k,
                 v=v,
-                # k_cache=key_cache[:, :cache_loc, :, :],
-                # v_cache=value_cache[:, :cache_loc, :, :],
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seq_len_q,
+                max_seqlen_k=max_seq_len_k,
             )
 
             o = result
