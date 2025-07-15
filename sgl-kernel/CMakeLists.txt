@@ -82,6 +82,14 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flash-attention)
+# sage-attention
+FetchContent_Declare(
+    repo-sage-attention
+    GIT_REPOSITORY https://github.com/thu-ml/SageAttention
+    GIT_TAG        main
+    GIT_SHALLOW    OFF
+)
+FetchContent_Populate(repo-sage-attention)
 # mscclpp
 FetchContent_Declare(
     repo-mscclpp
@@ -136,7 +144,6 @@ set(SGL_KERNEL_CUDA_FLAGS
     "--expt-relaxed-constexpr"
     "--expt-extended-lambda"
     "--threads=32"
-
     # Suppress warnings
     "-Xcompiler=-Wconversion"
     "-Xcompiler=-fno-strict-aliasing"
@@ -310,6 +317,35 @@ target_compile_definitions(common_ops PRIVATE
 )
 
 install(TARGETS common_ops LIBRARY DESTINATION sgl_kernel)
+
+# ============================ SageAttention Install ============================= #
+set(SGL_SAGE_KERNEL_CUDA_FLAGS
+    "-O3"
+    "-std=c++17"
+    "-U__CUDA_NO_HALF_OPERATORS__"
+    "-U__CUDA_NO_HALF_CONVERSIONS__"
+    "-gencode=arch=compute_90a,code=sm_90a"
+    "--use_fast_math"
+    "--threads=8"
+    "-Xptxas=-v"
+    "-diag-suppress=174" # suppress the specific warning
+)
+
+set(SAGE_SOURCES
+    "csrc/sage_extension.cc"
+    "${repo-sage-attention_SOURCE_DIR}/csrc/fused/fused.cu"
+    "${repo-sage-attention_SOURCE_DIR}/csrc/qattn/qk_int_sv_f8_cuda_sm90.cu"
+)
+
+Python_add_library(sage_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SAGE_SOURCES})
+
+target_compile_options(sage_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_SAGE_KERNEL_CUDA_FLAGS}>)
+target_include_directories(sage_ops PRIVATE
+    ${repo-sage-attention_SOURCE_DIR}/csrc
+)
+
+target_link_libraries(sage_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
+install(TARGETS sage_ops LIBRARY DESTINATION "sgl_kernel")
 
 # ============================ Optional Install ============================= #
 # set flash-attention sources file

@@ -1374,6 +1374,16 @@ class ModelRunner:
             )
 
             return FlashAttentionBackend(self)
+        elif self.server_args.attention_backend == "sa":
+            assert torch.cuda.get_device_capability()[0] == 9 and torch.cuda.get_device_capability()[1] == 0, (
+                "SageAttention Backend only support SM=90 currently. "
+            )
+            from sglang.srt.layers.attention.sageattention_backend import (
+                SageAttentionBackend,
+            )
+
+            return SageAttentionBackend(self)
+
         elif self.server_args.attention_backend == "cutlass_mla":
             from sglang.srt.layers.attention.cutlass_mla_backend import (
                 CutlassMLABackend,
