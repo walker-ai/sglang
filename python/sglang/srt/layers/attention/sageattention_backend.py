@@ -114,16 +114,18 @@ class SageAttentionBackend(AttentionBackend):
             # TODO(walker-ai): currently not support speculative decoding, Normal Decode
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
-
-            kv_indices = torch.empty(
-                forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
-            )
-
             metadata.cu_seqlens_q = torch.arange(
                 0, batch_size + 1, dtype=torch.int32, device=device
             )
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
+            )
+
+            # kv_indice part
+            kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
+            kv_indptr = kv_indptr[: bs + 1]
+            kv_indices = torch.empty(
+                forward_batch.seq_lens_sum, dtype=torch.int32, device=self.device
             )
 
             create_flashinfer_kv_indices_triton[(bs,)](
@@ -136,6 +138,7 @@ class SageAttentionBackend(AttentionBackend):
                 self.req_to_token.stride(0),
             )
 
+            # update self.kv_indices
             self.kv_indices = kv_indices
 
             # self._init_local_attn_metadata(metadata, device)
@@ -150,10 +153,28 @@ class SageAttentionBackend(AttentionBackend):
             )
             metadata.cu_seqlens_q = metadata.cu_seqlens_k
             
+            # kv_indice part
+            kv_indptr[1 : bs + 1] = torch.cumsum(
+                forward_batch.extend_prefix_lens, dim=0
+            )
+            kv_indptr = kv_indptr[: bs + 1]
+            kv_indices = torch.empty(
+                forward_batch.extend_prefix_lens.sum().item(),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                forward_batch.req_pool_indices,
+                forward_batch.extend_prefix_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
 
-            # Setup local attention if enabled
-            # if forward_batch.forward_mode == ForwardMode.EXTEND:
-            #     self._init_local_attn_metadata(metadata, device)
+            # update self.kv_indices
+            self.kv_indices = kv_indices
 
         self.forward_metadata = metadata
         
@@ -307,20 +328,20 @@ class SageAttentionBackend(AttentionBackend):
             #     forward_batch.batch_size, -1, layer.tp_v_head_num, layer.head_dim
             # )
 
-            kv_indices_ref = torch.cat(
-                [
-                    self.req_to_token[forward_batch.req_pool_indices[i], :forward_batch.seq_lens[i]] 
-                    for i in range(forward_batch.batch_size)
-                ],
-                dim=0,
-            ).contiguous()
+            # kv_indices_ref = torch.cat(
+            #     [
+            #         self.req_to_token[forward_batch.req_pool_indices[i], :forward_batch.seq_lens[i]] 
+            #         for i in range(forward_batch.batch_size)
+            #     ],
+            #     dim=0,
+            # ).contiguous()
 
 
-            k = key_cache[kv_indices_ref, :, :]
-            v = value_cache[kv_indices_ref, :, :]
+            # k = key_cache[kv_indices_ref, :, :]
+            # v = value_cache[kv_indices_ref, :, :]
 
-            # k = key_cache[self.kv_indices, :, :]
-            # v = value_cache[self.kv_indices, :, :]
+            k = key_cache[self.kv_indices, :, :]
+            v = value_cache[self.kv_indices, :, :]
 
             k = k.view(
                 cu_seqlens_k[-1], layer.tp_k_head_num, layer.head_dim
