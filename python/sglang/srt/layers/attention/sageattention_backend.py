@@ -178,6 +178,169 @@ class SageAttentionBackend(AttentionBackend):
 
         self.forward_metadata = metadata
         
+    def init_cuda_graph_state(self, max_bs: int):
+        """Initialize CUDA graph state for the attention backend.
+
+        Args:
+            max_bs (int): Maximum batch size to support in CUDA graphs
+
+        This creates fixed-size tensors that will be reused during CUDA graph replay
+        to avoid memory allocations.
+        """
+        self.cuda_graph_kv_indptr = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=self.device
+        )
+        self.cuda_graph_kv_indices = torch.zeros(
+            (max_bs * self.max_context_len,),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        self.cuda_graph_cu_seqlens_q = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=self.device
+        )
+        self.cuda_graph_cu_seqlens_k = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=self.device
+        )
+
+        # Create a persistent metadata object for CUDA graph
+        self.forward_metadata = SageAttentionMetadata(
+            cu_seqlens_q=self.cuda_graph_cu_seqlens_q,
+            cu_seqlens_k=self.cuda_graph_cu_seqlens_k,
+        )
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    ):
+        """Initialize forward metadata for capturing CUDA graph."""
+        metadata = self.forward_metadata
+        device = self.device
+
+        if forward_mode.is_decode():
+            metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
+            metadata.max_seq_len_k = seq_lens.max().item()
+
+            # Use copy_ to fill the pre-allocated tensors.
+            # This operation IS captured by CUDA graph.
+            metadata.cu_seqlens_q.copy_(
+                torch.arange(0, bs + 1, dtype=torch.int32, device=device)
+            )
+            metadata.cu_seqlens_k.copy_(
+                torch.nn.functional.pad(
+                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                )
+            )
+
+            # Re-use pre-allocated tensors for CUDA graph capture
+            kv_indptr = self.cuda_graph_kv_indptr[: bs + 1]
+            kv_indices = self.cuda_graph_kv_indices[:num_tokens]
+
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token, 
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+        elif forward_mode.is_extend():
+            metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
+            metadata.max_seq_len_k = seq_lens.max().item()
+            metadata.max_seq_len_q = num_tokens // bs
+
+            # Use copy_ to fill the pre-allocated tensors
+            metadata.cu_seqlens_k.copy_(
+                torch.nn.functional.pad(
+                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                )
+            )
+            metadata.cu_seqlens_q.copy_(metadata.cu_seqlens_k)
+
+            # Re-use pre-allocated tensors for CUDA graph capture
+            kv_indptr = self.cuda_graph_kv_indptr[: bs + 1]
+            kv_indices = self.cuda_graph_kv_indices[:num_tokens]
+
+            kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token, 
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+            
+        self.kv_indices = kv_indices
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        seq_lens_cpu: Optional[torch.Tensor],
+    ):
+        """Init the metadata for a forward pass for replaying a cuda graph."""
+        metadata = SageAttentionMetadata()
+        device = self.device
+        
+        if forward_mode.is_decode():
+            metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
+            # The max_seq_len_k for the cuda graph must be the same as during capture
+            metadata.max_seq_len_k = seq_lens_cpu.max().item()
+            metadata.cu_seqlens_q = self.kv_indptr[: bs + 1]
+            metadata.cu_seqlens_k = self.kv_indptr[: bs + 1]
+
+            # Update the pre-allocated tensors
+            metadata.cu_seqlens_q.copy_(
+                torch.arange(0, bs + 1, dtype=torch.int32, device=device)
+            )
+            metadata.cu_seqlens_k.copy_(
+                torch.nn.functional.pad(
+                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                )
+            )
+            
+            # The kv_indices buffer will be updated by the Triton kernel
+            # when the graph is launched. We only need to ensure it's
+            # big enough and the pointer is passed correctly.
+            self.cuda_graph_kv_indices = self.cuda_graph_kv_indices[:seq_lens_sum]
+
+        elif forward_mode.is_extend():
+            metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
+            metadata.max_seq_len_k = seq_lens_cpu.max().item()
+            metadata.max_seq_len_q = seq_lens_sum // bs
+
+            metadata.cu_seqlens_k = self.kv_indptr[: bs + 1]
+            metadata.cu_seqlens_q = self.kv_indptr[: bs + 1]
+
+            metadata.cu_seqlens_k.copy_(
+                torch.nn.functional.pad(
+                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                )
+            )
+            metadata.cu_seqlens_q.copy_(metadata.cu_seqlens_k)
+
+            # The kv_indices buffer will be updated by the Triton kernel
+            self.cuda_graph_kv_indices = self.cuda_graph_kv_indices[:seq_lens_sum]
+
+        self.forward_metadata = metadata
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 1
+
 
     def forward_extend(
         self,
