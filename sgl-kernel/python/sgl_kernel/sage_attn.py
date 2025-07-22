@@ -104,6 +104,8 @@ def sageattn_varlen(
     is_causal: bool = False,
     sm_scale: Optional[float] = None, 
     smooth_k: bool = True,
+    q_scale_out: Optional[torch.Tensor] = None,
+    k_scale_out: Optional[torch.Tensor] = None,
     **kwargs: Any,
 ) -> torch.Tensor:
     """
@@ -212,7 +214,8 @@ def sageattn_varlen(
     if dtype == torch.bfloat16 or dtype == torch.float32:
         v = v.to(torch.float16)
 
-    q_int8, q_scale, k_int8, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale = per_block_int8_varlen_triton(q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=sm_scale)
+
+    q_int8, q_scale, k_int8, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale = per_block_int8_varlen_triton(q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, q_scale_out, k_scale_out, sm_scale=sm_scale)
 
     if is_causal:
         o = attn_true_varlen(q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=dtype)

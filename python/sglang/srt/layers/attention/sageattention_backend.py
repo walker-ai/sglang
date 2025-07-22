@@ -9,6 +9,7 @@ import torch
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
@@ -75,6 +76,14 @@ class SageAttentionBackend(AttentionBackend):
         skip_prefill: bool = False,
     ):
         super().__init__()
+
+        self.num_q_heads = (
+            model_runner.model_config.num_attention_heads // get_attention_tp_size()
+        )
+
+        self.num_kv_heads = model_runner.model_config.get_num_kv_heads(
+            get_attention_tp_size()
+        )
 
         self.forward_metadata: SageAttentionMetadata = None
         self.max_context_len = model_runner.model_config.context_len
@@ -178,6 +187,189 @@ class SageAttentionBackend(AttentionBackend):
 
         self.forward_metadata = metadata
         
+    def init_cuda_graph_state(self, max_bs: int):
+        """Initialize CUDA graph state for the attention backend.
+
+        Args:
+            max_bs (int): Maximum batch size to support in CUDA graphs
+
+        This creates fixed-size tensors that will be reused during CUDA graph replay
+        to avoid memory allocations.
+        """
+        self.cuda_cache_seqlens_int32 =  torch.zeros(
+            max_bs, dtype=torch.int32, device=self.device
+        )
+        self.cuda_graph_kv_indptr = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=self.device
+        )
+        self.cuda_graph_kv_indices = torch.zeros(
+            (max_bs * self.max_context_len,),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        self.cuda_graph_cu_seqlens_q = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=self.device
+        )
+        self.cuda_graph_cu_seqlens_k = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=self.device
+        )
+
+        """ For qk_int8 uantization """
+        # self.q_int8_out = torch.zeros(
+        #     (max_bs * self.max_context_len, )
+        # )
+        BLKQ = 128 # 从你的函数中获取
+        BLKK = 64  # 从你的函数中获取
+
+        # 计算 q_scale 的最大长度总和
+        self.max_q_blocks_per_seq = (1 + BLKQ - 1) // BLKQ
+        self.max_q_scale_len_sum = self.max_q_blocks_per_seq * max_bs
+
+        # 计算 k_scale 的最大长度总和
+        self.max_k_blocks_per_seq = (1 + BLKK - 1) // BLKK
+        self.max_k_scale_len_sum = self.max_k_blocks_per_seq * max_bs
+
+
+        # for per_block
+        self.cuda_graph_q_scale_buffer = torch.zeros(
+            (self.max_q_scale_len_sum, self.num_q_heads),
+            device=self.device,
+            dtype=torch.float32
+        )
+
+        self.cuda_graph_k_scale_buffer = torch.zeros(
+            (self.max_k_scale_len_sum, self.num_kv_heads),
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+
+        # Create a persistent metadata object for CUDA graph
+        self.forward_metadata = SageAttentionMetadata(
+            cu_seqlens_q=self.cuda_graph_cu_seqlens_q,
+            cu_seqlens_k=self.cuda_graph_cu_seqlens_k,
+        )
+    
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+    ):
+        """Initialize forward metadata for capturing CUDA graph."""
+        metadata = self.forward_metadata
+        device = self.device
+
+        if forward_mode.is_decode():
+            metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
+
+            metadata.max_seq_len_k = seq_lens.max().item()
+
+            # Use copy_ to fill the pre-allocated tensors.
+            # This operation IS captured by CUDA graph.
+            metadata.cu_seqlens_q[:bs + 1].copy_(
+                torch.arange(0, bs + 1, dtype=torch.int32, device=device)
+            )
+            metadata.cu_seqlens_k[:bs + 1].copy_(
+                torch.nn.functional.pad(
+                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
+                )
+            )
+
+            # Re-use pre-allocated tensors for CUDA graph capture
+            kv_indptr = self.cuda_graph_kv_indptr[: bs + 1]
+            kv_indices = self.cuda_graph_kv_indices
+
+            kv_indptr[1 : bs + 1].copy_(
+                torch.cumsum(seq_lens, dim=0)
+            )
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token, 
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+        else:
+            raise NotImplementedError(f"Unsupported cuda-graph capture {forward_mode=}")
+            
+        self.kv_indices = self.cuda_graph_kv_indices
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
+        seq_lens_cpu: Optional[torch.Tensor],
+    ):
+        """Init the metadata for a forward pass for replaying a cuda graph."""
+        seq_lens = seq_lens[:bs]
+        
+        metadata = self.forward_metadata
+        device = self.device
+
+    
+        # print(f"DEBUG: bs={bs}, seq_lens.shape={seq_lens.shape}")
+        # print(f"DEBUG: metadata.cu_seqlens_k.shape={metadata.cu_seqlens_k.shape}")
+        # print(f"DEBUG: metadata.cache_seqlens_int32.shape={metadata.cache_seqlens_int32.shape}")
+
+        
+        if forward_mode.is_decode():
+            
+            metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
+
+            metadata.max_seq_len_k = seq_lens_cpu.max().item()
+
+            # Update the pre-allocated tensors
+            metadata.cu_seqlens_q[:bs + 1].copy_(
+                torch.arange(0, bs + 1, dtype=torch.int32, device=device)
+            )
+
+            # tmp = torch.nn.functional.pad(torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0))
+            # print(f"DEBUG: tmp = {tmp}, tmp.shape={tmp.shape}")
+
+            # print(f"DEBUG: metadata.cu_seqlens_k = {metadata.cu_seqlens_k}, metadata.cu_seqlens_k.shape={metadata.cu_seqlens_k.shape}")
+
+            metadata.cu_seqlens_k[:bs + 1].copy_(
+                torch.nn.functional.pad(
+                    torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
+                )
+            )
+            
+            # Re-use pre-allocated tensors for CUDA graph capture
+            kv_indptr = self.cuda_graph_kv_indptr[: bs + 1]
+            kv_indices = self.cuda_graph_kv_indices
+
+            kv_indptr[1 : bs + 1].copy_(
+                torch.cumsum(seq_lens, dim=0)
+            )
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token, 
+                req_pool_indices,
+                seq_lens,
+                kv_indptr,
+                None,
+                kv_indices,
+                self.req_to_token.stride(0),
+            )
+
+        else:
+            raise NotImplementedError(f"Unsupported cuda-graph replay {forward_mode=}")
+
+        self.forward_metadata = metadata
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 1
 
     def forward_extend(
         self,
@@ -268,6 +460,7 @@ class SageAttentionBackend(AttentionBackend):
 
             # print(f"DEBUG: self.kv_indices = {self.kv_indices}, self.kv_indices.dtype = {self.kv_indices.dtype}")
             
+            print(f"DEBUG: execute prefill")
             result = sageattn_varlen(
                 q=q,
                 key_cache=key_cache,
@@ -363,7 +556,7 @@ class SageAttentionBackend(AttentionBackend):
             # )
 
             q_reshaped = q.contiguous().view(
-                cu_seqlens_q[-1], layer.tp_q_head_num, layer.head_dim
+                -1, layer.tp_q_head_num, layer.head_dim
             )
 
             # Default: single-token self-attention
@@ -376,6 +569,8 @@ class SageAttentionBackend(AttentionBackend):
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seq_len_q,
                 max_seqlen_k=max_seq_len_k,
+                q_scale_out=self.cuda_graph_q_scale_buffer,
+                k_scale_out=self.cuda_graph_k_scale_buffer,
             )
 
             o = result
