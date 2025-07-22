@@ -96,7 +96,7 @@ def sageattn_varlen(
     q: torch.Tensor, 
     key_cache: torch.Tensor, 
     value_cache: torch.Tensor, 
-    kv_indices: torch.Tensor,
+    kv_indices: Optional[torch.Tensor],
     cu_seqlens_q: torch.Tensor, 
     cu_seqlens_k: torch.Tensor, 
     max_seqlen_q: int, 
@@ -178,49 +178,46 @@ def sageattn_varlen(
 
     if head_dim_og < 64:
         q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
+        # k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
+        # v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
     elif head_dim_og > 64 and head_dim_og < 128:
         q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
+        # k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
+        # v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
     elif head_dim_og > 128:
         raise ValueError(f"Unsupported head_dim: {head_dim_og}")
 
-    assert q.stride(-1) == 1, "Last dim of qkv must be contiguous."
+    assert q.stride(-1) == 1
     assert cu_seqlens_q.is_contiguous() and cu_seqlens_k.is_contiguous(), "cu_seqlens_q and cu_seqlens_k must be contiguous."
     assert kv_indices.is_contiguous(), "kv_indices must be contiguous."
 
-    
+    # if dtype == torch.bfloat16 or dtype == torch.float32:
+    #     v = v.to(torch.float16)
 
     # if smooth_k:
-    #     k = key_cache[kv_indices, :, :]
     #     km = k.mean(dim=0, keepdim=True) # ! km is calculated on the all the batches. Calculate over each individual sequence requires dedicated kernel.
     #     k = k - km
 
     if sm_scale is None:
         sm_scale = 1.0 / (head_dim_og ** 0.5)
 
-    # TODO(yiyun): need to split this kernel into mean_kernel and indice_kernel
+    # print(f"DEBUG: key_cache.shape = {key_cache.shape}, kv_indices = {kv_indices}, kv_indices.shape = {kv_indices.shape}")
+
     k, km = triton_mean_normalize(key_cache, kv_indices)
     if smooth_k:
         k = k - km
-
-    q_int8, q_scale, k_int8, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale = per_block_int8_varlen_triton(
-        q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=sm_scale,
-    )
 
     v, _ = triton_mean_normalize(value_cache, kv_indices)
 
     if dtype == torch.bfloat16 or dtype == torch.float32:
         v = v.to(torch.float16)
 
+    q_int8, q_scale, k_int8, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale = per_block_int8_varlen_triton(q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sm_scale=sm_scale)
+
     if is_causal:
-        o = attn_true_varlen(
-            q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
-            q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=dtype
-        )
+        o = attn_true_varlen(q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=dtype)
     else:
-        o = attn_false_varlen(
-            q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
-            q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=dtype
-        )
+        o = attn_false_varlen(q_int8, k_int8, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, q_scale, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale, output_dtype=dtype)
 
     o = o[..., :head_dim_og]
 

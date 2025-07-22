@@ -178,161 +178,6 @@ class SageAttentionBackend(AttentionBackend):
 
         self.forward_metadata = metadata
         
-    def init_cuda_graph_state(self, max_bs: int):
-        """Initialize CUDA graph state for the attention backend.
-
-        Args:
-            max_bs (int): Maximum batch size to support in CUDA graphs
-
-        This creates fixed-size tensors that will be reused during CUDA graph replay
-        to avoid memory allocations.
-        """
-        self.cuda_cache_seqlens_int32 =  torch.zeros(
-            max_bs, dtype=torch.int32, device=self.device
-        )
-        self.cuda_graph_kv_indptr = torch.zeros(
-            (max_bs + 1,), dtype=torch.int32, device=self.device
-        )
-        self.cuda_graph_kv_indices = torch.zeros(
-            (max_bs * self.max_context_len,),
-            dtype=torch.int32,
-            device="cuda",
-        )
-        self.cuda_graph_cu_seqlens_q = torch.zeros(
-            (max_bs + 1,), dtype=torch.int32, device=self.device
-        )
-        self.cuda_graph_cu_seqlens_k = torch.zeros(
-            (max_bs + 1,), dtype=torch.int32, device=self.device
-        )
-
-        # Create a persistent metadata object for CUDA graph
-        self.forward_metadata = SageAttentionMetadata(
-            cu_seqlens_q=self.cuda_graph_cu_seqlens_q,
-            cu_seqlens_k=self.cuda_graph_cu_seqlens_k,
-        )
-
-    def init_forward_metadata_capture_cuda_graph(
-        self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-    ):
-        """Initialize forward metadata for capturing CUDA graph."""
-        metadata = self.forward_metadata
-        device = self.device
-
-        if forward_mode.is_decode():
-            metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
-
-            metadata.max_seq_len_k = seq_lens.max().item()
-
-            # Use copy_ to fill the pre-allocated tensors.
-            # This operation IS captured by CUDA graph.
-            metadata.cu_seqlens_q[:bs + 1].copy_(
-                torch.arange(0, bs + 1, dtype=torch.int32, device=device)
-            )
-            metadata.cu_seqlens_k[:bs + 1].copy_(
-                torch.nn.functional.pad(
-                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
-                )
-            )
-
-            # Re-use pre-allocated tensors for CUDA graph capture
-            kv_indptr = self.cuda_graph_kv_indptr[: bs + 1]
-            kv_indices = self.cuda_graph_kv_indices
-
-            kv_indptr[1 : bs + 1].copy_(
-                torch.cumsum(seq_lens, dim=0)
-            )
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token, 
-                req_pool_indices,
-                seq_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-            )
-        else:
-            raise NotImplementedError(f"Unsupported cuda-graph capture {forward_mode=}")
-            
-        self.kv_indices = self.cuda_graph_kv_indices
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        """Init the metadata for a forward pass for replaying a cuda graph."""
-        seq_lens = seq_lens[:bs]
-        
-        metadata = self.forward_metadata
-        device = self.device
-
-    
-        print(f"DEBUG: bs={bs}, seq_lens.shape={seq_lens.shape}")
-        print(f"DEBUG: metadata.cu_seqlens_k.shape={metadata.cu_seqlens_k.shape}")
-        print(f"DEBUG: metadata.cache_seqlens_int32.shape={metadata.cache_seqlens_int32.shape}")
-
-        
-        if forward_mode.is_decode():
-            
-            metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
-
-            metadata.max_seq_len_k = seq_lens_cpu.max().item()
-
-
-            # Update the pre-allocated tensors
-            metadata.cu_seqlens_q[:bs + 1].copy_(
-                torch.arange(0, bs + 1, dtype=torch.int32, device=device)
-            )
-
-            # tmp = torch.nn.functional.pad(torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0))
-            # print(f"DEBUG: tmp = {tmp}, tmp.shape={tmp.shape}")
-
-            # print(f"DEBUG: metadata.cu_seqlens_k = {metadata.cu_seqlens_k}, metadata.cu_seqlens_k.shape={metadata.cu_seqlens_k.shape}")
-
-            metadata.cu_seqlens_k[:bs + 1].copy_(
-                torch.nn.functional.pad(
-                    torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
-                )
-            )
-            
-            # Re-use pre-allocated tensors for CUDA graph capture
-            kv_indptr = self.cuda_graph_kv_indptr[: bs + 1]
-            kv_indices = self.cuda_graph_kv_indices
-
-            kv_indptr[1 : bs + 1].copy_(
-                torch.cumsum(seq_lens, dim=0)
-            )
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token, 
-                req_pool_indices,
-                seq_lens,
-                kv_indptr,
-                None,
-                kv_indices,
-                self.req_to_token.stride(0),
-            )
-
-        else:
-            raise NotImplementedError(f"Unsupported cuda-graph replay {forward_mode=}")
-
-        self.forward_metadata = metadata
-
-    def get_cuda_graph_seq_len_fill_value(self):
-        return 1
-
 
     def forward_extend(
         self,
@@ -356,6 +201,7 @@ class SageAttentionBackend(AttentionBackend):
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
+                    self.kv_indices = cache_loc.to(torch.int32)
                 else:
                     raise NotImplementedError("SageAttention does not support MLA currently.")
 
@@ -412,11 +258,21 @@ class SageAttentionBackend(AttentionBackend):
             v= v.view(
                 cu_seqlens_k[-1], layer.tp_v_head_num, layer.head_dim
             )
+
+            # print(f"DEBUG: cache_loc = {cache_loc}")
+            # print(f"DEBUG: k = {k}, k.shape = {k.shape}")
+            # print(f"DEBUG: v = {v}, v.shape = {v.shape}")
+
+            # print(f"DEBUG: key_cache = {key_cache[cache_loc, :, :]}")
+            # print(f"DEBUG: value_cache = {value_cache[cache_loc], :, :]}")
+
+            # print(f"DEBUG: self.kv_indices = {self.kv_indices}, self.kv_indices.dtype = {self.kv_indices.dtype}")
             
             result = sageattn_varlen(
                 q=q,
-                k=k,
-                v=v,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                kv_indices=self.kv_indices,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seq_len_q,
