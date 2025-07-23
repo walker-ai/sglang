@@ -107,6 +107,29 @@ class SageAttentionBackend(AttentionBackend):
             (max_bs + 1,), dtype=torch.int32, device=model_runner.device
         )
 
+        BLKQ = 128 # 从你的函数中获取
+        BLKK = 64  # 从你的函数中获取
+
+        # 计算 q_scale 的最大长度总和
+        self.max_q_blocks_per_seq = (1 + BLKQ - 1) // BLKQ
+        self.max_q_scale_len_sum = self.max_q_blocks_per_seq * max_bs
+
+        # 计算 k_scale 的最大长度总和
+        self.max_k_blocks_per_seq = (1 + BLKK - 1) // BLKK
+        self.max_k_scale_len_sum = self.max_k_blocks_per_seq * max_bs
+
+        self.q_scale_out = torch.zeros(
+            (16 * 1, self.num_q_heads),
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+        self.k_scale_out = torch.zeros(
+            (16 * 1, self.num_kv_heads),
+            device=self.device,
+            dtype=torch.float32,
+        )
+
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -231,17 +254,17 @@ class SageAttentionBackend(AttentionBackend):
 
 
         # for per_block
-        self.cuda_graph_q_scale_buffer = torch.zeros(
-            (self.max_q_scale_len_sum, self.num_q_heads),
-            device=self.device,
-            dtype=torch.float32
-        )
+        # self.cuda_graph_q_scale_buffer = torch.zeros(
+        #     (self.max_q_scale_len_sum, self.num_q_heads),
+        #     device=self.device,
+        #     dtype=torch.float32
+        # )
 
-        self.cuda_graph_k_scale_buffer = torch.zeros(
-            (self.max_k_scale_len_sum, self.num_kv_heads),
-            device=self.device,
-            dtype=torch.float32,
-        )
+        # self.cuda_graph_k_scale_buffer = torch.zeros(
+        #     (self.max_k_scale_len_sum, self.num_kv_heads),
+        #     device=self.device,
+        #     dtype=torch.float32,
+        # )
 
 
         # Create a persistent metadata object for CUDA graph
@@ -460,7 +483,7 @@ class SageAttentionBackend(AttentionBackend):
 
             # print(f"DEBUG: self.kv_indices = {self.kv_indices}, self.kv_indices.dtype = {self.kv_indices.dtype}")
             
-            print(f"DEBUG: execute prefill")
+            # print(f"DEBUG: execute prefill")
             result = sageattn_varlen(
                 q=q,
                 key_cache=key_cache,
@@ -471,6 +494,8 @@ class SageAttentionBackend(AttentionBackend):
                 max_seqlen_q=max_seq_len_q,
                 max_seqlen_k=max_seq_len_k,
                 is_causal=True,
+                q_scale_out=self.q_scale_out,
+                k_scale_out=self.k_scale_out,
             )
 
          
@@ -569,8 +594,8 @@ class SageAttentionBackend(AttentionBackend):
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seq_len_q,
                 max_seqlen_k=max_seq_len_k,
-                q_scale_out=self.cuda_graph_q_scale_buffer,
-                k_scale_out=self.cuda_graph_k_scale_buffer,
+                q_scale_out=self.q_scale_out,
+                k_scale_out=self.k_scale_out,
             )
 
             o = result
