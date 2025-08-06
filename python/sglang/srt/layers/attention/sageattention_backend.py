@@ -56,6 +56,8 @@ class SageAttentionMetadata:
     # Page table for the encoder
     encoder_page_table: torch.Tensor = None
 
+    decode_cuda_graph_metadata = {}
+
     @dataclass
     class LocalAttentionMetadata:
         local_query_start_loc: torch.Tensor = None  # cu_seqlens_q for local attention
@@ -107,8 +109,8 @@ class SageAttentionBackend(AttentionBackend):
             (max_bs + 1,), dtype=torch.int32, device=model_runner.device
         )
 
-        BLKQ = 128 # 从你的函数中获取
-        BLKK = 64  # 从你的函数中获取
+        BLKQ = 128 
+        BLKK = 64
 
         # 计算 q_scale 的最大长度总和
         self.max_q_blocks_per_seq = (1 + BLKQ - 1) // BLKQ
@@ -119,13 +121,14 @@ class SageAttentionBackend(AttentionBackend):
         self.max_k_scale_len_sum = self.max_k_blocks_per_seq * max_bs
 
         self.q_scale_out = torch.zeros(
-            (16 * 1, self.num_q_heads),
+            ## 这里的参数是为了让支持更大的bs，暂时先这样设置
+            (64 * 1, self.num_q_heads),
             device=self.device,
             dtype=torch.float32,
         )
 
         self.k_scale_out = torch.zeros(
-            (16 * 1, self.num_kv_heads),
+            (64 * 1, self.num_kv_heads),
             device=self.device,
             dtype=torch.float32,
         )
@@ -266,12 +269,22 @@ class SageAttentionBackend(AttentionBackend):
         #     dtype=torch.float32,
         # )
 
+        self.decode_cuda_graph_metadata = {
+            "cache_seqlens": torch.zeros(max_bs, dtype=torch.int32, device=self.device),
+            "cu_seqlens_q": torch.arange(
+                0, max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+            "cu_seqlens_k": torch.zeros(
+                max_bs + 1, dtype=torch.int32, device=self.device
+            ),
+        }
 
-        # Create a persistent metadata object for CUDA graph
-        self.forward_metadata = SageAttentionMetadata(
-            cu_seqlens_q=self.cuda_graph_cu_seqlens_q,
-            cu_seqlens_k=self.cuda_graph_cu_seqlens_k,
-        )
+
+        # # Create a persistent metadata object for CUDA graph
+        # self.forward_metadata = SageAttentionMetadata(
+        #     cu_seqlens_q=self.cuda_graph_cu_seqlens_q,
+        #     cu_seqlens_k=self.cuda_graph_cu_seqlens_k,
+        # )
     
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -284,7 +297,8 @@ class SageAttentionBackend(AttentionBackend):
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
         """Initialize forward metadata for capturing CUDA graph."""
-        metadata = self.forward_metadata
+        # metadata = self.forward_metadata
+        metadata = SageAttentionMetadata()
         device = self.device
 
         if forward_mode.is_decode():
@@ -294,14 +308,13 @@ class SageAttentionBackend(AttentionBackend):
 
             # Use copy_ to fill the pre-allocated tensors.
             # This operation IS captured by CUDA graph.
-            metadata.cu_seqlens_q[:bs + 1].copy_(
-                torch.arange(0, bs + 1, dtype=torch.int32, device=device)
+            metadata.cu_seqlens_q = torch.arange(0, bs + 1, dtype=torch.int32, device=device)
+            
+            metadata.cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
             )
-            metadata.cu_seqlens_k[:bs + 1].copy_(
-                torch.nn.functional.pad(
-                    torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
-                )
-            )
+            
+            print(f"capture's seq_lens = {seq_lens=}")
 
             # Re-use pre-allocated tensors for CUDA graph capture
             kv_indptr = self.cuda_graph_kv_indptr[: bs + 1]
@@ -319,10 +332,13 @@ class SageAttentionBackend(AttentionBackend):
                 kv_indices,
                 self.req_to_token.stride(0),
             )
+
+            self.decode_cuda_graph_metadata[bs] = metadata
         else:
             raise NotImplementedError(f"Unsupported cuda-graph capture {forward_mode=}")
             
         self.kv_indices = self.cuda_graph_kv_indices
+        self.forward_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -338,7 +354,7 @@ class SageAttentionBackend(AttentionBackend):
         """Init the metadata for a forward pass for replaying a cuda graph."""
         seq_lens = seq_lens[:bs]
         
-        metadata = self.forward_metadata
+        metadata = None
         device = self.device
 
     
@@ -348,7 +364,7 @@ class SageAttentionBackend(AttentionBackend):
 
         
         if forward_mode.is_decode():
-            
+            metadata = self.decode_cuda_graph_metadata[bs]
             metadata.cache_seqlens_int32 = seq_lens.to(torch.int32)
 
             metadata.max_seq_len_k = seq_lens_cpu.max().item()
@@ -368,6 +384,8 @@ class SageAttentionBackend(AttentionBackend):
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
                 )
             )
+
+            print(f"replay's metadata.cache_seqlens_int32 = {metadata.cache_seqlens_int32}")
             
             # Re-use pre-allocated tensors for CUDA graph capture
             kv_indptr = self.cuda_graph_kv_indptr[: bs + 1]
@@ -484,7 +502,7 @@ class SageAttentionBackend(AttentionBackend):
             # print(f"DEBUG: self.kv_indices = {self.kv_indices}, self.kv_indices.dtype = {self.kv_indices.dtype}")
             
             # print(f"DEBUG: execute prefill")
-            result = sageattn_varlen(
+            result, res1, res2 = sageattn_varlen(
                 q=q,
                 key_cache=key_cache,
                 value_cache=value_cache,
@@ -498,14 +516,14 @@ class SageAttentionBackend(AttentionBackend):
                 k_scale_out=self.k_scale_out,
             )
 
-         
+
             o = result
 
-            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
-            
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim), res1, res2#q, k, v, key_cache, value_cache, self.kv_indices#, res1, res2
 
-            
-    
+
+
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -585,7 +603,7 @@ class SageAttentionBackend(AttentionBackend):
             )
 
             # Default: single-token self-attention
-            result = sageattn_varlen(
+            result, res1, res2 = sageattn_varlen(
                 q=q_reshaped,
                 key_cache=key_cache,
                 value_cache=value_cache,
@@ -600,4 +618,4 @@ class SageAttentionBackend(AttentionBackend):
 
             o = result
 
-            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim), res1, res2#q, k, v, key_cache, value_cache, self.kv_indices#, res1, res2
