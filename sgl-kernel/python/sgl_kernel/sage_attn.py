@@ -205,11 +205,11 @@ def sageattn_varlen(
 
     # print(f"DEBUG: key_cache.shape = {key_cache.shape}, kv_indices = {kv_indices}, kv_indices.shape = {kv_indices.shape}")
 
-    k, km = triton_mean_normalize(key_cache, kv_indices)
+    k, km = triton_mean_normalize(key_cache, kv_indices, cu_seqlens_k)
     if smooth_k:
         k = k - km
 
-    v, _ = triton_mean_normalize(value_cache, kv_indices)
+    v, _ = triton_mean_normalize(value_cache, kv_indices, cu_seqlens_k)
 
     if dtype == torch.bfloat16 or dtype == torch.float32:
         v = v.to(torch.float16)

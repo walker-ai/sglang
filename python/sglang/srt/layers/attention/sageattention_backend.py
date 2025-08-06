@@ -120,15 +120,15 @@ class SageAttentionBackend(AttentionBackend):
         self.max_k_blocks_per_seq = (1 + BLKK - 1) // BLKK
         self.max_k_scale_len_sum = self.max_k_blocks_per_seq * max_bs
 
+        ## 这里的参数是为了让支持更大的bs，暂时先这样设置
         self.q_scale_out = torch.zeros(
-            ## 这里的参数是为了让支持更大的bs，暂时先这样设置
-            (64 * 1, self.num_q_heads),
+            (1024 * 1, self.num_q_heads),
             device=self.device,
             dtype=torch.float32,
         )
 
         self.k_scale_out = torch.zeros(
-            (64 * 1, self.num_kv_heads),
+            (1024 * 1, self.num_kv_heads),
             device=self.device,
             dtype=torch.float32,
         )
@@ -314,8 +314,6 @@ class SageAttentionBackend(AttentionBackend):
                 torch.cumsum(seq_lens, dim=0, dtype=torch.int32), (1, 0)
             )
             
-            print(f"capture's seq_lens = {seq_lens=}")
-
             # Re-use pre-allocated tensors for CUDA graph capture
             kv_indptr = self.cuda_graph_kv_indptr[: bs + 1]
             kv_indices = self.cuda_graph_kv_indices
@@ -384,9 +382,7 @@ class SageAttentionBackend(AttentionBackend):
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32), (1, 0)
                 )
             )
-
-            print(f"replay's metadata.cache_seqlens_int32 = {metadata.cache_seqlens_int32}")
-            
+    
             # Re-use pre-allocated tensors for CUDA graph capture
             kv_indptr = self.cuda_graph_kv_indptr[: bs + 1]
             kv_indices = self.cuda_graph_kv_indices
@@ -502,7 +498,7 @@ class SageAttentionBackend(AttentionBackend):
             # print(f"DEBUG: self.kv_indices = {self.kv_indices}, self.kv_indices.dtype = {self.kv_indices.dtype}")
             
             # print(f"DEBUG: execute prefill")
-            result, res1, res2 = sageattn_varlen(
+            result = sageattn_varlen(
                 q=q,
                 key_cache=key_cache,
                 value_cache=value_cache,
@@ -519,7 +515,7 @@ class SageAttentionBackend(AttentionBackend):
 
             o = result
 
-            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim), res1, res2#q, k, v, key_cache, value_cache, self.kv_indices#, res1, res2
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 
 
@@ -603,7 +599,7 @@ class SageAttentionBackend(AttentionBackend):
             )
 
             # Default: single-token self-attention
-            result, res1, res2 = sageattn_varlen(
+            result = sageattn_varlen(
                 q=q_reshaped,
                 key_cache=key_cache,
                 value_cache=value_cache,
@@ -618,4 +614,4 @@ class SageAttentionBackend(AttentionBackend):
 
             o = result
 
-            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim), res1, res2#q, k, v, key_cache, value_cache, self.kv_indices#, res1, res2
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)

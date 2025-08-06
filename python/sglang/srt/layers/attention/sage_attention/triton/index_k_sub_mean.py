@@ -8,6 +8,8 @@ def mean_normalize_kernel(
     indices_ptr,          # [num_indices]
     output_ptr,           # [1, M, K]
     indices_selected_output_ptr, # [num_indices, M, K] - 选中的行
+    cu_seqlens_k,
+    bs,
     N, M, K,              # 维度
     num_indices,
     BLOCK_SIZE_M: tl.constexpr,
@@ -16,7 +18,18 @@ def mean_normalize_kernel(
     # 获取当前线程块处理的M和K位置
     pid_m = tl.program_id(axis=0)
     pid_k = tl.program_id(axis=1)
+    pid_b = tl.program_id(axis=2)
+
+    if pid_b >= bs:
+        return
+
+    # 根据 pid_b 获取当前批次的有效索引范围
+    cu_seqlens_k_start = tl.load(cu_seqlens_k + pid_b)
+    cu_seqlens_k_end = tl.load(cu_seqlens_k + pid_b + 1)
     
+    # 获取当前批次的有效序列长度
+    current_seq_len = cu_seqlens_k_end - cu_seqlens_k_start
+
     # 计算当前线程块处理的M和K的范围
     m_start = pid_m * BLOCK_SIZE_M
     k_start = pid_k * BLOCK_SIZE_K
@@ -36,11 +49,15 @@ def mean_normalize_kernel(
     
     # 初始化累加器
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tl.float32)
-    
+
     # 遍历所有指定的索引，累加对应的值
-    for i in range(num_indices):
+    for i in range(current_seq_len):
+        # 这里的 i 对应于当前批次中的相对位置
+        # 我们需要找到它在整个 k cache 中的绝对位置
+        global_idx = cu_seqlens_k_start + i
+
         # 加载索引
-        idx = tl.load(indices_ptr + i)
+        idx = tl.load(indices_ptr + global_idx)
         
         # 计算当前索引对应的数据地址
         # k[idx, m_indices, k_indices]
@@ -52,18 +69,16 @@ def mean_normalize_kernel(
 
         # 同时将选中的数据存储到 selected_output
         # selected_output[i, m_indices, k_indices] = data
-        selected_ptr = indices_selected_output_ptr + i * M * K + m_indices[:, None] * K + k_indices[None, :]
+        selected_ptr = indices_selected_output_ptr + global_idx * M * K + m_indices[:, None] * K + k_indices[None, :]
         tl.store(selected_ptr, data, mask=mask)
     
-    # 计算均值（除以索引数量）
-    mean_result = accumulator / num_indices
-    
+
     # 计算输出地址并存储结果
     # output[0, m_indices, k_indices] = mean_result
     output_ptr_tile = output_ptr + m_indices[:, None] * K + k_indices[None, :]
-    tl.store(output_ptr_tile, mean_result, mask=mask)
+    tl.atomic_add(output_ptr_tile, accumulator, mask=mask)
 
-def triton_mean_normalize(k: torch.Tensor, indices: torch.Tensor):
+def triton_mean_normalize(k: torch.Tensor, indices: torch.Tensor, cu_seqlens_k: torch.Tensor):
     """
     使用 Triton 内核对指定索引的行在第0维上求均值。
     
@@ -84,7 +99,7 @@ def triton_mean_normalize(k: torch.Tensor, indices: torch.Tensor):
     num_indices = indices.shape[0]
     
     # 创建输出张量
-    output = torch.zeros((1, M, K), device=k.device, dtype=k.dtype)
+    output = torch.zeros((1, M, K), device=k.device, dtype=torch.float32)
     indices_selected_output = torch.zeros((num_indices, M, K), device=k.device, dtype=k.dtype)
 
     # 设置块大小
@@ -97,20 +112,24 @@ def triton_mean_normalize(k: torch.Tensor, indices: torch.Tensor):
     
     grid_m = cdiv(M, BLOCK_SIZE_M)
     grid_k = cdiv(K, BLOCK_SIZE_K)
-    
+
     # 启动内核
     mean_normalize_kernel[(grid_m, grid_k)](
         k_ptr=k,
         indices_ptr=indices,
         output_ptr=output,
         indices_selected_output_ptr=indices_selected_output,
+        cu_seqlens_k=cu_seqlens_k,
+        bs=len(cu_seqlens_k) - 1,
         N=N, M=M, K=K,
         num_indices=num_indices,
         BLOCK_SIZE_M=BLOCK_SIZE_M,
         BLOCK_SIZE_K=BLOCK_SIZE_K
     )
+
+
     
-    return indices_selected_output, output
+    return indices_selected_output, output.to(torch.bfloat16) / cu_seqlens_k[-1]
 
 # -----------------------------------------------------------------------------
 # 示例用法和验证
