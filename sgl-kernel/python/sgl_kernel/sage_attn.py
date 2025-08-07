@@ -6,7 +6,7 @@ import torch.nn as nn
 from sglang.srt.layers.attention.sage_attention.triton.quant_per_block_varlen import per_block_int8 as per_block_int8_varlen_triton
 from sglang.srt.layers.attention.sage_attention.triton.attn_qk_int8_block_varlen import forward as attn_false_varlen
 from sglang.srt.layers.attention.sage_attention.triton.attn_qk_int8_per_block_causal_varlen import forward as attn_true_varlen
-from sglang.srt.layers.attention.sage_attention.triton.index_k_sub_mean import triton_mean_normalize
+from sglang.srt.layers.attention.sage_attention.triton.index_k_sub_mean import triton_mean_normalize_k, triton_mean_normalize_v
 
 try:
     from sgl_kernel import sage_ops
@@ -203,17 +203,14 @@ def sageattn_varlen(
     if sm_scale is None:
         sm_scale = 1.0 / (head_dim_og ** 0.5)
 
-    # print(f"DEBUG: key_cache.shape = {key_cache.shape}, kv_indices = {kv_indices}, kv_indices.shape = {kv_indices.shape}")
+    k = triton_mean_normalize_k(key_cache, kv_indices, cu_seqlens_k)
+    # if smooth_k:
+    #     k = k - km
+    
+    v = triton_mean_normalize_v(value_cache, kv_indices, cu_seqlens_k)
 
-    k, km = triton_mean_normalize(key_cache, kv_indices, cu_seqlens_k)
-    if smooth_k:
-        k = k - km
-
-    v, _ = triton_mean_normalize(value_cache, kv_indices, cu_seqlens_k)
-
-    if dtype == torch.bfloat16 or dtype == torch.float32:
-        v = v.to(torch.float16)
-
+    # if dtype == torch.bfloat16 or dtype == torch.float32:
+    #     v = v.to(torch.float16)
 
     q_int8, q_scale, k_int8, k_scale, cu_seqlens_q_scale, cu_seqlens_k_scale = per_block_int8_varlen_triton(q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, q_scale_out, k_scale_out, sm_scale=sm_scale)
 
