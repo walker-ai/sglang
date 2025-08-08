@@ -270,6 +270,348 @@ def triton_mean_normalize_v(v: torch.Tensor, indices: torch.Tensor, cu_seqlens_v
 
     return indices_selected_output
 
+# ----------------------------
+# Kernel 1: 对每个 selected index 做加载 -> 写入 selected_output -> atomic_add 到 output
+# 每个 kernel block 负责 (BLOCK_SIZE_M x BLOCK_SIZE_K) 的 tile，
+# grid = (grid_m, grid_k, num_indices)
+# ----------------------------
+@triton.jit
+def kernel_accumulate_one_index_k(
+    k_ptr,                      # pointer to k: shape [N, M, K]
+    indices_ptr,                # pointer to indices: shape [num_indices]
+    output_ptr,                 # pointer to output: shape [1, M, K] (float32)
+    indices_selected_output_ptr,# pointer to selected output: shape [num_indices, M, K]
+    M, K, num_indices,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_INDICE: tl.constexpr,    # 新增编译期常量
+):
+    pid_m = tl.program_id(axis=0)   # tile index along M
+    pid_k = tl.program_id(axis=1)   # tile index along K
+    pid_idx = tl.program_id(axis=2) # which selected index (0..num_blocks-1)
+
+    offs_idx = tl.arange(0, BLOCK_SIZE_INDICE)   # 新增，用来向量化处理多个索引
+
+    # 计算实际索引
+    idxs = pid_idx * BLOCK_SIZE_INDICE + offs_idx
+
+    # 越界mask，防止访问超过num_indices
+    valid_mask = idxs < num_indices
+
+    m_start = pid_m * BLOCK_SIZE_M
+    k_start = pid_k * BLOCK_SIZE_K
+
+    offs_m = tl.arange(0, BLOCK_SIZE_M)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    m_idx = m_start + offs_m            # (BLOCK_SIZE_M,)
+    k_idx = k_start + offs_k            # (BLOCK_SIZE_K,)
+
+    # masks for bounds
+    m_mask = m_idx < M
+    k_mask = k_idx < K
+    mask = m_mask[:, None] & k_mask[None, :]
+
+    # load the actual global idx from indices, shape (INDICES_PER_BLOCK,)
+    idx_vals = tl.load(indices_ptr + idxs, mask=valid_mask, other=0)   # shape (INDICES_PER_BLOCK,)
+
+    # base pointers (elements)
+    # k layout assumed contiguous as [N, M, K] -> index calc: idx * (M*K) + m * K + k
+    base_ks = idx_vals * (M * K)
+
+    # ptrs shape will be broadcasted to (INDICES_PER_BLOCK, BLOCK_SIZE_M, BLOCK_SIZE_K)
+    ptrs = base_ks[:, None, None] + m_idx[None, :, None] * K + k_idx[None, None, :]
+
+    # load data from k
+    load_mask = valid_mask[:, None, None] & mask[None, :, :]
+    data = tl.load(k_ptr + ptrs, mask=load_mask, other=0.0)  # dtype = k.dtype (e.g., float16)
+
+    # write to indices_selected_output[pid_idx * INDICES_PER_BLOCK + offs_idx, m_idx, k_idx]
+    base_selected = idxs * (M * K)
+    selected_ptrs = base_selected[:, None, None] + m_idx[None, :, None] * K + k_idx[None, None, :]
+    tl.store(indices_selected_output_ptr + selected_ptrs, data, mask=load_mask)
+
+    # atomic add to output[0, m_idx, k_idx]
+    base_output = 0  # since output is [1, M, K] with leading dim 1
+    out_ptrs = base_output + m_idx[:, None] * K + k_idx[None, :]
+    # ensure we're adding in float32 to preserve accumulation precision (like original)
+    # Triton atomic_add supports same dtype; if k is float16 we cast
+    # We'll cast loaded data to float32 for atomic add (typical practice).
+
+    data_fp32 = tl.cast(data, tl.float32)
+
+    # 对所有有效indices求和：tl.sum(axis=0)
+    acc = tl.sum(data_fp32, axis=0)
+
+    tl.atomic_add(output_ptr + out_ptrs, acc, mask=mask)
+
+# ----------------------------
+# Kernel 1: 对每个 selected index 做加载 -> 写入 selected_output -> atomic_add 到 output
+# 每个 kernel block 负责 (BLOCK_SIZE_M x BLOCK_SIZE_K) 的 tile，
+# grid = (grid_m, grid_k, num_indices)
+# ----------------------------
+@triton.jit
+def kernel_accumulate_one_index_v(
+    v_ptr,                      # pointer to k: shape [N, M, K]
+    indices_ptr,                # pointer to indices: shape [num_indices]
+    indices_selected_output_ptr,# pointer to selected output: shape [num_indices, M, K]
+    N, M, K, num_indices,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_INDICE: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)   # tile index along M
+    pid_k = tl.program_id(axis=1)   # tile index along K
+    pid_idx = tl.program_id(axis=2) # which selected index (0..num_indices-1)
+
+    offs_idx = tl.arange(0, BLOCK_SIZE_INDICE)   # 新增，用来向量化处理多个索引
+
+    # 计算实际索引
+    idxs = pid_idx * BLOCK_SIZE_INDICE + offs_idx
+
+    # 越界mask，防止访问超过num_indices
+    valid_mask = idxs < num_indices
+
+    m_start = pid_m * BLOCK_SIZE_M
+    k_start = pid_k * BLOCK_SIZE_K
+
+    offs_m = tl.arange(0, BLOCK_SIZE_M)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    m_idx = m_start + offs_m            # (BLOCK_SIZE_M,)
+    k_idx = k_start + offs_k            # (BLOCK_SIZE_K,)
+
+    # masks for bounds
+    m_mask = m_idx < M
+    k_mask = k_idx < K
+    mask = m_mask[:, None] & k_mask[None, :]
+
+    # load the actual global idx from indices, shape (INDICES_PER_BLOCK,)
+    idx_vals = tl.load(indices_ptr + idxs, mask=valid_mask, other=0)   # shape (INDICES_PER_BLOCK,)
+
+    # base pointers (elements)
+    # k layout assumed contiguous as [N, M, K] -> index calc: idx * (M*K) + m * K + k
+    base_ks = idx_vals * (M * K)
+
+    # ptrs shape will be broadcasted to (INDICES_PER_BLOCK, BLOCK_SIZE_M, BLOCK_SIZE_K)
+    ptrs = base_ks[:, None, None] + m_idx[None, :, None] * K + k_idx[None, None, :]
+
+    # load data from v
+    load_mask = valid_mask[:, None, None] & mask[None, :, :]
+    data = tl.load(v_ptr + ptrs, mask=load_mask, other=0.0)  # dtype = v.dtype (e.g., float16)
+
+    # write to indices_selected_output[pid_idx * INDICES_PER_BLOCK + offs_idx, m_idx, k_idx]
+    base_selected = idxs * (M * K)
+    selected_ptrs = base_selected[:, None, None] + m_idx[None, :, None] * K + k_idx[None, None, :]
+
+    data_fp16 = tl.cast(data, tl.float16)
+    tl.store(indices_selected_output_ptr + selected_ptrs, data_fp16, mask=load_mask)
+
+# ----------------------------
+# Kernel 2: 将 output 除以 mean_divisor（标量）
+# grid = (grid_m, grid_k)
+# ----------------------------
+@triton.jit
+def kernel_divide_output_by_divisor(
+    output_ptr,      # float32 [1, M, K]
+    mean_divisor,    # float32 scalar (passed as a tensor element)
+    M, K,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    pid_k = tl.program_id(axis=1)
+
+    m_start = pid_m * BLOCK_SIZE_M
+    k_start = pid_k * BLOCK_SIZE_K
+
+    offs_m = tl.arange(0, BLOCK_SIZE_M)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    m_idx = m_start + offs_m
+    k_idx = k_start + offs_k
+
+    m_mask = m_idx < M
+    k_mask = k_idx < K
+    mask = m_mask[:, None] & k_mask[None, :]
+
+    base_output = 0
+    out_ptrs = base_output + m_idx[:, None] * K + k_idx[None, :]
+
+    out_tile = tl.load(output_ptr + out_ptrs, mask=mask, other=0.0)  # float32
+    # mean_divisor is a pointer to a scalar tensor element; we receive it as python arg, so pass in as scalar
+    mean_val = tl.load(mean_divisor)
+    # Avoid division by zero (not expected if mean_divisor>0)
+    res = out_tile / mean_val
+    tl.store(output_ptr + out_ptrs, res, mask=mask)
+
+
+# ----------------------------
+# Kernel 3: 每个 selected-index 的 tile 减去 mean（output 已经被除以 divisor）
+# grid = (grid_m, grid_k, num_indices)
+# ----------------------------
+@triton.jit
+def kernel_subtract_mean_from_selected(
+    output_ptr,                 # float32 [1, M, K] (mean already computed)
+    indices_selected_output_ptr,# dtype same as k
+    num_indices,
+    M, K,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    BLOCK_SIZE_INDICE: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    pid_k = tl.program_id(axis=1)
+    pid_idx = tl.program_id(axis=2)
+
+    offs_idx = tl.arange(0, BLOCK_SIZE_INDICE)
+
+    idxs = pid_idx * BLOCK_SIZE_INDICE + offs_idx  # 计算真实索引范围
+
+    valid_mask = idxs < num_indices  # 越界掩码
+
+    m_start = pid_m * BLOCK_SIZE_M
+    k_start = pid_k * BLOCK_SIZE_K
+
+    offs_m = tl.arange(0, BLOCK_SIZE_M)
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+    m_idx = m_start + offs_m
+    k_idx = k_start + offs_k
+
+    m_mask = m_idx < M
+    k_mask = k_idx < K
+    mask = m_mask[:, None] & k_mask[None, :]
+
+    # load selected data
+    base_selected = idxs * (M * K)  # shape (INDICES_PER_BLOCK)
+    selected_ptrs = base_selected[:, None, None] + m_idx[None, :, None] * K + k_idx[None, None, :]
+    load_mask = valid_mask[:, None, None] & mask[None, :, :]
+    sel = tl.load(indices_selected_output_ptr + selected_ptrs, mask=load_mask, other=0.0)
+
+    # load mean (output)
+    base_output = 0
+    out_ptrs = base_output + m_idx[:, None] * K + k_idx[None, :]
+    mean_tile = tl.load(output_ptr + out_ptrs, mask=mask, other=0.0)  # float32
+
+    # cast mean to selected dtype if needed
+    mean_cast = tl.cast(mean_tile, tl.bfloat16)
+    normalized = sel - mean_cast
+    tl.store(indices_selected_output_ptr + selected_ptrs, normalized, mask=load_mask)
+
+
+# ----------------------------
+# Host wrapper: triton_mean_normalize_k
+# ----------------------------
+def triton_mean_normalize_k_gpt(k: torch.Tensor, indices: torch.Tensor, cu_seqlens_k: torch.Tensor):
+    """
+    k: [N, M, K] (any dtype)
+    indices: [num_indices] int32/64
+    cu_seqlens_k: prefix sums for batches, shape [bs + 1]
+                  NOTE: this function preserves the original "mean_divisor" semantics used in your snippet:
+                  mean_divisor = cu_seqlens_k[-1]  (a scalar)
+    returns: indices_selected_output tensor, shape [num_indices, M, K], dtype same as k
+    """
+
+    assert k.is_cuda and indices.is_cuda and cu_seqlens_k.is_cuda
+
+    N, M, K = k.shape
+    num_indices = indices.shape[0]
+
+    # output as float32 accumulation (same as original)
+    output = torch.empty((1, M, K), device=k.device, dtype=torch.float32)
+    indices_selected_output = torch.empty((num_indices, M, K), device=k.device, dtype=k.dtype)
+
+    # tile sizes (kept same as you used)
+    BLOCK_SIZE_M = 8
+    BLOCK_SIZE_K = 128
+    BLOCK_SIZE_INDICE = 8
+
+    def cdiv(a, b):
+        return (a + b - 1) // b
+
+    grid_m = cdiv(M, BLOCK_SIZE_M)
+    grid_k = cdiv(K, BLOCK_SIZE_K)
+    grid_indice = cdiv(256, BLOCK_SIZE_INDICE)
+    
+
+    # Kernel 1: accumulate per selected index
+    # Note: grid is (grid_m, grid_k, num_indices)
+
+    # 暂时用DTYPE_ID代替，0代表k的输出 dtype = tl.float32
+    grid1 = (grid_m, grid_k, grid_indice)
+    kernel_accumulate_one_index_k[grid1](
+        k, indices, output, indices_selected_output,
+        M, K, num_indices,
+        BLOCK_SIZE_M=BLOCK_SIZE_M, 
+        BLOCK_SIZE_K=BLOCK_SIZE_K, 
+        BLOCK_SIZE_INDICE=BLOCK_SIZE_INDICE,
+    )
+
+    # Kernel 2: divide output by mean_divisor (use same mean_divisor as your snippet)
+    # Your original snippet passed mean_divisor = cu_seqlens_k[-1]
+    # We will read that scalar on host and pass it in
+    grid2 = (grid_m, grid_k)
+    kernel_divide_output_by_divisor[grid2](
+        output, 
+        cu_seqlens_k[-1], 
+        M, 
+        K,
+        BLOCK_SIZE_M=BLOCK_SIZE_M, 
+        BLOCK_SIZE_K=BLOCK_SIZE_K
+    )
+
+    # Kernel 3: subtract mean from selected outputs
+    grid3 = (grid_m, grid_k, grid_indice)
+    kernel_subtract_mean_from_selected[grid3](
+        output, indices_selected_output, num_indices, M, K,
+        BLOCK_SIZE_M=BLOCK_SIZE_M, 
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        BLOCK_SIZE_INDICE=BLOCK_SIZE_INDICE,
+    )
+
+    return indices_selected_output
+
+def triton_mean_normalize_v_gpt(v: torch.Tensor, indices: torch.Tensor, cu_seqlens_v: torch.Tensor):
+    """
+    v: [N, M, K] (any dtype)
+    indices: [num_indices] int32/64
+    cu_seqlens_v: prefix sums for batches, shape [bs + 1]
+                  NOTE: this function preserves the original "mean_divisor" semantics used in your snippet:
+                  mean_divisor = cu_seqlens_k[-1]  (a scalar)
+    returns: indices_selected_output tensor, shape [num_indices, M, K], dtype same as k
+    """
+    assert v.is_cuda and indices.is_cuda and cu_seqlens_v.is_cuda
+
+    N, M, K = v.shape
+    num_indices = indices.shape[0]
+
+    indices_selected_output = torch.empty((num_indices, M, K), device=v.device, dtype=torch.float16)
+
+    # tile sizes (kept same as you used)
+    BLOCK_SIZE_M = 8
+    BLOCK_SIZE_K = 128
+    BLOCK_SIZE_INDICE = 8
+
+    def cdiv(a, b):
+        return (a + b - 1) // b
+
+    grid_m = cdiv(M, BLOCK_SIZE_M)
+    grid_k = cdiv(K, BLOCK_SIZE_K)
+    grid_indice = cdiv(256, BLOCK_SIZE_INDICE)
+
+
+    grid1 = (grid_m, grid_k, grid_indice)
+    kernel_accumulate_one_index_v[grid1](
+        v, indices, indices_selected_output,
+        N, M, K, num_indices,
+        BLOCK_SIZE_M=BLOCK_SIZE_M, 
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        BLOCK_SIZE_INDICE=BLOCK_SIZE_INDICE,
+    )
+
+    return indices_selected_output
+
 # -----------------------------------------------------------------------------
 # 示例用法和验证
 # -----------------------------------------------------------------------------
