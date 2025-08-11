@@ -532,8 +532,7 @@ def triton_mean_normalize_k_gpt(k: torch.Tensor, indices: torch.Tensor, cu_seqle
 
     grid_m = cdiv(M, BLOCK_SIZE_M)
     grid_k = cdiv(K, BLOCK_SIZE_K)
-    grid_indice = cdiv(256, BLOCK_SIZE_INDICE)
-    
+    grid_indice = cdiv(num_indices, BLOCK_SIZE_INDICE)
 
     # Kernel 1: accumulate per selected index
     # Note: grid is (grid_m, grid_k, num_indices)
@@ -598,7 +597,7 @@ def triton_mean_normalize_v_gpt(v: torch.Tensor, indices: torch.Tensor, cu_seqle
 
     grid_m = cdiv(M, BLOCK_SIZE_M)
     grid_k = cdiv(K, BLOCK_SIZE_K)
-    grid_indice = cdiv(256, BLOCK_SIZE_INDICE)
+    grid_indice = cdiv(num_indices, BLOCK_SIZE_INDICE)
 
 
     grid1 = (grid_m, grid_k, grid_indice)
