@@ -248,11 +248,11 @@ def triton_mean_normalize_v(v: torch.Tensor, indices: torch.Tensor, cu_seqlens_v
     # 设置块大小
     BLOCK_SIZE_M = 8
     BLOCK_SIZE_K = 128
-    
+
     # 计算网格大小
     def cdiv(a, b):
         return (a + b - 1) // b
-    
+
     grid_m = cdiv(M, BLOCK_SIZE_M)
     grid_k = cdiv(K, BLOCK_SIZE_K)
 
@@ -282,6 +282,7 @@ def kernel_accumulate_one_index_k(
     output_ptr,                 # pointer to output: shape [1, M, K] (float32)
     indices_selected_output_ptr,# pointer to selected output: shape [num_indices, M, K]
     M, K, num_indices,
+    actual_indice,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_INDICE: tl.constexpr,    # 新增编译期常量
@@ -296,7 +297,7 @@ def kernel_accumulate_one_index_k(
     idxs = pid_idx * BLOCK_SIZE_INDICE + offs_idx
 
     # 越界mask，防止访问超过num_indices
-    valid_mask = idxs < num_indices
+    valid_mask = idxs < tl.load(actual_indice)
 
     m_start = pid_m * BLOCK_SIZE_M
     k_start = pid_k * BLOCK_SIZE_K
@@ -356,6 +357,7 @@ def kernel_accumulate_one_index_v(
     indices_ptr,                # pointer to indices: shape [num_indices]
     indices_selected_output_ptr,# pointer to selected output: shape [num_indices, M, K]
     N, M, K, num_indices,
+    actual_indice,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_INDICE: tl.constexpr,
@@ -369,8 +371,9 @@ def kernel_accumulate_one_index_v(
     # 计算实际索引
     idxs = pid_idx * BLOCK_SIZE_INDICE + offs_idx
 
+
     # 越界mask，防止访问超过num_indices
-    valid_mask = idxs < num_indices
+    valid_mask = idxs < tl.load(actual_indice)
 
     m_start = pid_m * BLOCK_SIZE_M
     k_start = pid_k * BLOCK_SIZE_K
@@ -454,6 +457,7 @@ def kernel_divide_output_by_divisor(
 def kernel_subtract_mean_from_selected(
     output_ptr,                 # float32 [1, M, K] (mean already computed)
     indices_selected_output_ptr,# dtype same as k
+    actual_indice,
     num_indices,
     M, K,
     BLOCK_SIZE_M: tl.constexpr,
@@ -468,7 +472,7 @@ def kernel_subtract_mean_from_selected(
 
     idxs = pid_idx * BLOCK_SIZE_INDICE + offs_idx  # 计算真实索引范围
 
-    valid_mask = idxs < num_indices  # 越界掩码
+    valid_mask = idxs < tl.load(actual_indice)  # 越界掩码
 
     m_start = pid_m * BLOCK_SIZE_M
     k_start = pid_k * BLOCK_SIZE_K
@@ -503,7 +507,7 @@ def kernel_subtract_mean_from_selected(
 # ----------------------------
 # Host wrapper: triton_mean_normalize_k
 # ----------------------------
-def triton_mean_normalize_k_gpt(k: torch.Tensor, indices: torch.Tensor, cu_seqlens_k: torch.Tensor):
+def triton_mean_normalize_k_gpt(k: torch.Tensor, indices: torch.Tensor, cu_seqlens_k: torch.Tensor, mean_k: torch.Tensor, indices_selected_k_output: torch.Tensor):
     """
     k: [N, M, K] (any dtype)
     indices: [num_indices] int32/64
@@ -512,15 +516,16 @@ def triton_mean_normalize_k_gpt(k: torch.Tensor, indices: torch.Tensor, cu_seqle
                   mean_divisor = cu_seqlens_k[-1]  (a scalar)
     returns: indices_selected_output tensor, shape [num_indices, M, K], dtype same as k
     """
-
     assert k.is_cuda and indices.is_cuda and cu_seqlens_k.is_cuda
 
     N, M, K = k.shape
     num_indices = indices.shape[0]
 
     # output as float32 accumulation (same as original)
-    output = torch.empty((1, M, K), device=k.device, dtype=torch.float32)
-    indices_selected_output = torch.empty((num_indices, M, K), device=k.device, dtype=k.dtype)
+    # output = torch.zeros((1, M, K), device=k.device, dtype=torch.float32)
+    output = mean_k
+    # indices_selected_output = torch.zeros((130, M, K), device=k.device, dtype=k.dtype)
+    indices_selected_output = indices_selected_k_output
 
     # tile sizes (kept same as you used)
     BLOCK_SIZE_M = 8
@@ -532,7 +537,7 @@ def triton_mean_normalize_k_gpt(k: torch.Tensor, indices: torch.Tensor, cu_seqle
 
     grid_m = cdiv(M, BLOCK_SIZE_M)
     grid_k = cdiv(K, BLOCK_SIZE_K)
-    grid_indice = cdiv(num_indices, BLOCK_SIZE_INDICE)
+    grid_indice = cdiv(4096, BLOCK_SIZE_INDICE)
 
     # Kernel 1: accumulate per selected index
     # Note: grid is (grid_m, grid_k, num_indices)
@@ -542,8 +547,9 @@ def triton_mean_normalize_k_gpt(k: torch.Tensor, indices: torch.Tensor, cu_seqle
     kernel_accumulate_one_index_k[grid1](
         k, indices, output, indices_selected_output,
         M, K, num_indices,
-        BLOCK_SIZE_M=BLOCK_SIZE_M, 
-        BLOCK_SIZE_K=BLOCK_SIZE_K, 
+        cu_seqlens_k[-1],
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
         BLOCK_SIZE_INDICE=BLOCK_SIZE_INDICE,
     )
 
@@ -553,7 +559,7 @@ def triton_mean_normalize_k_gpt(k: torch.Tensor, indices: torch.Tensor, cu_seqle
     grid2 = (grid_m, grid_k)
     kernel_divide_output_by_divisor[grid2](
         output, 
-        cu_seqlens_k[-1], 
+        cu_seqlens_k[-1],
         M, 
         K,
         BLOCK_SIZE_M=BLOCK_SIZE_M, 
@@ -563,15 +569,17 @@ def triton_mean_normalize_k_gpt(k: torch.Tensor, indices: torch.Tensor, cu_seqle
     # Kernel 3: subtract mean from selected outputs
     grid3 = (grid_m, grid_k, grid_indice)
     kernel_subtract_mean_from_selected[grid3](
-        output, indices_selected_output, num_indices, M, K,
+        output, indices_selected_output, 
+        cu_seqlens_k[-1],
+        num_indices, M, K,
         BLOCK_SIZE_M=BLOCK_SIZE_M, 
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         BLOCK_SIZE_INDICE=BLOCK_SIZE_INDICE,
     )
 
-    return indices_selected_output
+    return indices_selected_output, cu_seqlens_k[-1]
 
-def triton_mean_normalize_v_gpt(v: torch.Tensor, indices: torch.Tensor, cu_seqlens_v: torch.Tensor):
+def triton_mean_normalize_v_gpt(v: torch.Tensor, indices: torch.Tensor, cu_seqlens_v: torch.Tensor, indices_selected_v_output: torch.Tensor):
     """
     v: [N, M, K] (any dtype)
     indices: [num_indices] int32/64
@@ -585,25 +593,29 @@ def triton_mean_normalize_v_gpt(v: torch.Tensor, indices: torch.Tensor, cu_seqle
     N, M, K = v.shape
     num_indices = indices.shape[0]
 
-    indices_selected_output = torch.empty((num_indices, M, K), device=v.device, dtype=torch.float16)
+    # indices_selected_output = torch.zeros((130, M, K), device=v.device, dtype=torch.float16)
+    indices_selected_output = indices_selected_v_output
 
     # tile sizes (kept same as you used)
     BLOCK_SIZE_M = 8
     BLOCK_SIZE_K = 128
     BLOCK_SIZE_INDICE = 8
 
+    bs = cu_seqlens_v[-1] - 1
+
     def cdiv(a, b):
         return (a + b - 1) // b
 
     grid_m = cdiv(M, BLOCK_SIZE_M)
     grid_k = cdiv(K, BLOCK_SIZE_K)
-    grid_indice = cdiv(num_indices, BLOCK_SIZE_INDICE)
+    grid_indice = cdiv(4096, BLOCK_SIZE_INDICE)
 
 
     grid1 = (grid_m, grid_k, grid_indice)
     kernel_accumulate_one_index_v[grid1](
         v, indices, indices_selected_output,
         N, M, K, num_indices,
+        cu_seqlens_v[-1],
         BLOCK_SIZE_M=BLOCK_SIZE_M, 
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         BLOCK_SIZE_INDICE=BLOCK_SIZE_INDICE,
@@ -618,18 +630,22 @@ def triton_mean_normalize_v_gpt(v: torch.Tensor, indices: torch.Tensor, cu_seqle
 if __name__ == '__main__':
     # 在 GPU 上创建模拟数据
     N, M, K = 551276, 8, 128
-    num_indices = 16
+    num_indices = 1000
     
     # 创建测试数据
     k_tensor = torch.randn(N, M, K, device='cuda')  # 使用随机数便于验证
     indices_tensor = torch.randint(0, N, (num_indices,), device='cuda')
+
+    mean_k = torch.zeros((1, M, K), device='cuda', dtype=k_tensor.dtype)
+    indices_selected_k_output = torch.zeros((num_indices, M, K), device='cuda', dtype=k_tensor.dtype)
+    cu_seqlens_k = torch.tensor([0, num_indices], device='cuda')
     
     print(f"输入张量形状: {k_tensor.shape}")
     print(f"索引张量: {indices_tensor}")
     print(f"索引数量: {num_indices}")
     
     # 调用 Triton 内核
-    result_triton = triton_mean_normalize(k_tensor, indices_tensor)
+    result_triton, _ = triton_mean_normalize_k_gpt(k_tensor, indices_tensor, cu_seqlens_k, mean_k, indices_selected_k_output)
     
     # 使用 PyTorch 原生操作进行验证
     # 步骤1: 根据索引切分
@@ -637,7 +653,7 @@ if __name__ == '__main__':
     print(f"选中的张量形状: {k_selected.shape}")
     
     # 步骤2: 在第0维求均值
-    result_torch = k_selected.mean(dim=0, keepdim=True)  # [1, M, K]
+    result_torch = k_selected#k_selected.mean(dim=0, keepdim=True)  # [1, M, K]
     
     print(f"Triton结果形状: {result_triton.shape}")
     print(f"PyTorch结果形状: {result_torch.shape}")

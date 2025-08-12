@@ -133,6 +133,16 @@ class SageAttentionBackend(AttentionBackend):
             dtype=torch.float32,
         )
 
+        self.mean_k = torch.zeros(
+            (1, 8, 128), device=self.device, dtype=torch.float32
+        )
+        self.indices_selected_k_output = torch.zeros(
+            (4096, 8, 128), device=self.device, dtype=torch.bfloat16,
+        )
+        self.indices_selected_v_output = torch.zeros(
+            (4096, 8, 128), device=self.device, dtype=torch.float16,
+        )
+
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -354,12 +364,9 @@ class SageAttentionBackend(AttentionBackend):
         
         metadata = None
         device = self.device
-
-    
         # print(f"DEBUG: bs={bs}, seq_lens.shape={seq_lens.shape}")
         # print(f"DEBUG: metadata.cu_seqlens_k.shape={metadata.cu_seqlens_k.shape}")
         # print(f"DEBUG: metadata.cache_seqlens_int32.shape={metadata.cache_seqlens_int32.shape}")
-
         
         if forward_mode.is_decode():
             metadata = self.decode_cuda_graph_metadata[bs]
@@ -399,7 +406,6 @@ class SageAttentionBackend(AttentionBackend):
                 kv_indices,
                 self.req_to_token.stride(0),
             )
-
         else:
             raise NotImplementedError(f"Unsupported cuda-graph replay {forward_mode=}")
 
@@ -510,6 +516,9 @@ class SageAttentionBackend(AttentionBackend):
                 is_causal=True,
                 q_scale_out=self.q_scale_out,
                 k_scale_out=self.k_scale_out,
+                mean_k=self.mean_k,
+                indices_selected_k_output=self.indices_selected_k_output,
+                indices_selected_v_output=self.indices_selected_v_output,
             )
 
 
@@ -610,6 +619,9 @@ class SageAttentionBackend(AttentionBackend):
                 max_seqlen_k=max_seq_len_k,
                 q_scale_out=self.q_scale_out,
                 k_scale_out=self.k_scale_out,
+                mean_k=self.mean_k,
+                indices_selected_k_output=self.indices_selected_k_output,
+                indices_selected_v_output=self.indices_selected_v_output,
             )
 
             o = result

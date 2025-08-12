@@ -97,7 +97,7 @@ def per_block_int8(q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
         C=head_dim, BLK=BLKQ,
     )
 
-    grid = ((max_seqlen_k + BLKK - 1) // BLKK, h_kv, b)
+    grid = ((4096 + BLKK - 1) // BLKK, h_kv, b)
     quant_per_block_int8_kernel[grid](
         k, k_int8, k_scale_out,
         cu_seqlens_k, cu_seqlens_k_scale,
@@ -107,4 +107,4 @@ def per_block_int8(q, k, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
         C=head_dim, BLK=BLKK,
     )
 
-    return q_int8, q_scale_out, k_int8, k_scale_out, cu_seqlens_q_scale, cu_seqlens_k_scale
+    return q_int8, q_scale_out, k_int8, k_scale_out, cu_seqlens_q_scale, cu_seqlens_k_scale, grid
