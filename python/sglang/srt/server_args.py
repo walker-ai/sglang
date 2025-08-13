@@ -1329,6 +1329,7 @@ class ServerArgs:
             "trtllm_mha",
             "dual_chunk_flash_attn",
             "wave",
+            "sage",
         ]
         parser.add_argument(
             "--attention-backend",
