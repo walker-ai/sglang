@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Dict
+
 """
 Copyright 2023-2024 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -97,6 +99,12 @@ class TreeNode:
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
 
+        # 新增字段用于差分存储
+        self.base_node: Optional[TreeNode] = None  # 存储差分节点所依赖的基础节点映射
+        self.delta_node: Dict[str, TreeNode] = {}  # 存储所有差分节点 {extra_key: node}  
+        self.is_base: bool = False  # 标记是否为基础节点 
+        self.delta_data: Optional[torch.Tensor] = None  # 存储差分数据（如果是差分节点）
+
     @property
     def evicted(self):
         return self.value is None
@@ -162,6 +170,22 @@ def _key_match_paged(key0: RadixKey, key1: RadixKey, page_size: int):
 
     return i
 
+def _key_match_token_only(key0: RadixKey, key1: RadixKey):
+    # TODO: 实现仅用 token 来进行匹配的函数
+
+    # 其实就是不进行 extra_key 的检查，pass _check_extra_key(key0, key1)
+    i = 0
+    for k0, k1 in zip(key0.token_ids, key1.token_ids):
+        if k0 != k1:
+            break
+        i += 1
+    return i
+
+def get_child_key_token_only(key: RadixKey, page_size: int = 1):
+    if page_size == 1:
+        return key.token_ids[0]
+    else:
+        return tuple(key.token_ids[:page_size])
 
 def get_child_key(key: RadixKey, page_size: int = 1):
     if page_size == 1:
@@ -194,6 +218,7 @@ class RadixCache(BasePrefixCache):
         enable_kv_cache_events: bool = False,
         eviction_policy: str = "lru",
         is_eagle: bool = False,
+        enable_delta_cache: Optional[bool] = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -202,18 +227,23 @@ class RadixCache(BasePrefixCache):
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue = []
         self.is_eagle = is_eagle
+        self.enable_delta_cache = enable_delta_cache
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
         else:
             self.device = torch.device("cpu")
 
-        if self.page_size == 1:
-            self.key_match_fn = _key_match_page_size1
-            self.get_child_key_fn = get_child_key
+        if enable_delta_cache:
+            self.key_match_fn = _key_match_token_only
+            self.get_child_key_fn = get_child_key_token_only
         else:
-            self.key_match_fn = partial(_key_match_paged, page_size=page_size)
-            self.get_child_key_fn = partial(get_child_key, page_size=page_size)
+            if self.page_size == 1:
+                self.key_match_fn = _key_match_page_size1
+                self.get_child_key_fn = get_child_key
+            else:
+                self.key_match_fn = partial(_key_match_paged, page_size=page_size)
+                self.get_child_key_fn = partial(get_child_key, page_size=page_size)
 
         if is_eagle:
             self.key_convert_fn = _convert_to_bigram_key
@@ -314,6 +344,12 @@ class RadixCache(BasePrefixCache):
             value = torch.cat(value)
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
+
+        # # 如果启用了差分缓存，且没有找到完全匹配
+        # if kwargs['enable_delta_cache'] is True and len(value) < len(key):
+        #     # 尝试查找相同 token 序列但是不同 extra_key 的基础节点
+        #     pass
+
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
@@ -588,19 +624,64 @@ class RadixCache(BasePrefixCache):
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
-        new_node.key = child.key[:split_len]
-        new_node.value = child.value[:split_len]
+        new_node.key = child.key[:split_len] # new_node 是前缀
+        
+        # 预先设置 child.key (后缀)
+        child_key_suffix = child.key[split_len:]
+        
+        # --- 差分缓存分裂逻辑 ---
+        if self.enable_delta_cache:
+            # 1. Base 版本分裂
+            if child.is_base:
+                new_node.is_base = True
+                new_node.value = child.value[:split_len] # 前缀 value
+                child.value = child.value[split_len:]      # 后缀 value
+                # 确保 new_node 的 key 也存储了 base extra_key
+                new_node.key.extra_key = child.key.extra_key
+            
+            # 2. Delta 版本分裂
+            new_node.delta_node = {}
+            suffix_delta_nodes = {} # <--- 为 child (后缀) 创建新的 delta 字典
+            
+            for extra_key, delta_node in child.delta_node.items():
+                # 为 new_node (前缀) 创建一个新的 delta 节点
+                new_prefix_delta = TreeNode()
+                new_prefix_delta.key = delta_node.key[:split_len] # <--- 修正: delta key 也分裂
+                new_prefix_delta.key.extra_key = delta_node.key.extra_key
+                
+                new_prefix_delta.delta_data = delta_node.delta_data[:split_len]
+                new_prefix_delta.base_node = new_node
+                new_node.delta_node[extra_key] = new_prefix_delta
+                
+                # 为 child (后缀) 更新 *现有的* delta_node
+                delta_node.key = delta_node.key[split_len:] # <--- 修正: delta key 也分裂
+                delta_node.delta_data = delta_node.delta_data[split_len:]
+                delta_node.base_node = child # 指向新的后缀 base 节点
+                
+                # <--- 修正: 如果后缀 delta 不为空，则添加到新字典
+                if len(delta_node.delta_data) > 0:
+                    suffix_delta_nodes[extra_key] = delta_node
+            
+            # 3. 将 child 上的 delta 更新为仅包含后缀的字典
+            child.delta_node = suffix_delta_nodes
+            
+        else:
+            # --- 旧的非差分逻辑 ---
+            new_node.value = child.value[:split_len]
+            child.value = child.value[split_len:]
+        # --- 结束 ---
+
         child.parent = new_node
-        child.key = child.key[split_len:]
-        child.value = child.value[split_len:]
+        child.key = child_key_suffix # 在最后设置 child.key
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         self._record_store_event(new_node)
         self._record_store_event(child)
 
         return new_node
-
-    def _insert_helper(self, node: TreeNode, key: RadixKey, value):
+    
+    def _insert_helper_legacy(self, node: TreeNode, key: RadixKey, value):
+        """ 这是原版的 _insert_helper，用于非差分模式 """
         node.last_access_time = time.monotonic()
         if len(key) == 0:
             return 0
@@ -632,6 +713,111 @@ class RadixCache(BasePrefixCache):
             self.evictable_size_ += len(key)
             self._record_store_event(new_node)
         return total_prefix_length
+
+    def _insert_helper(self, node: TreeNode, key: RadixKey, value):
+        # 如果禁用了差分缓存，则使用旧的（非差分）逻辑
+        if not self.enable_delta_cache:
+            return self._insert_helper_legacy(node, key, value)
+        
+        # --- 差分缓存开启时的逻辑 ---
+        
+        node.last_access_time = time.monotonic()
+        if len(key) == 0:
+            return 0
+
+        child_key = self.get_child_key_fn(key) # token-only key
+        
+        # 我们需要保留原始的 key 和 value 以便 store
+        original_key = key
+        original_value = value
+
+        total_prefix_length = 0
+        while len(key) > 0 and child_key in node.children.keys():
+            node = node.children[child_key]
+            node.last_access_time = time.monotonic()
+            
+            # key_match_fn 也是 token-only
+            prefix_len = self.key_match_fn(node.key, key)
+            
+            if prefix_len < len(node.key):
+                # --- Case A: 节点分裂 ---
+                new_node = self._split_node(node.key, node, prefix_len)
+                
+                # 在分裂出的新父节点上存储
+                self._store_value_in_node(new_node, original_key, original_value) 
+                
+                return total_prefix_length + prefix_len
+
+            # --- Case B: 完美匹配节点，继续 ---
+            total_prefix_length += prefix_len
+            key = key[prefix_len:]
+            value = value[prefix_len:]
+
+            if len(key):
+                child_key = self.get_child_key_fn(key)
+
+        if len(key) == 0:
+            # --- Case C: 完美匹配路径 (key 是某个节点的精确前缀) ---
+            # (例如，插入 [1,2,3,4,5] for lora_B)
+            # node 是路径的最后一个节点 (Node_12345)
+            self._store_value_in_node(node, original_key, original_value)
+            return total_prefix_length
+        else:
+            # --- Case D: 匹配在节点边界停止 (需要添加新子节点) ---
+            # (例如，第一次插入 [1,2,3,4,5] for lora_A)
+            new_node = TreeNode()
+            new_node.parent = node # node 是 Node_Root
+            new_node.key = key # key 是 [1,2,3,4,5]
+            
+            # 存储
+            self._store_value_in_node(new_node, original_key, original_value)
+            
+            node.children[child_key] = new_node
+            self.evictable_size_ += len(key)
+            self._record_store_event(new_node)
+            return total_prefix_length
+    
+    def _store_value_in_node(self, node: TreeNode, key_with_extra: RadixKey, value_segment: torch.Tensor):
+        """
+        在给定的 token 节点上存储特定 extra_key 的 value。
+        """
+        if not self.enable_delta_cache:
+             node.value = value_segment # 旧逻辑
+             return
+
+        extra_key = key_with_extra.extra_key
+
+        # Case 1: 节点是空的 (没有 base)，将其设为 base
+        if not node.is_base:
+            node.is_base = True
+            # new_node.key 已经在 _insert_helper (Case C) 或 _split_node 中设置
+            # 我们只需要存储 extra_key 来标识 base
+            node.key.extra_key = extra_key 
+            node.value = value_segment
+        
+        # Case 2: 插入的 extra_key 与 base 相同 (覆盖 base)
+        elif node.key.extra_key == extra_key:
+            # 释放旧的 base value
+            if node.value is not None:
+                # self.token_to_kv_pool_allocator.free(node.value)
+                pass
+            node.value = value_segment
+        
+        # Case 3: 插入的 extra_key 是一个新的 "delta"
+        else:
+            delta_node = node.delta_node.get(extra_key)
+            if delta_node:
+                # 覆盖已有的 delta
+                if delta_node.delta_data is not None:
+                    self.token_to_kv_pool_allocator.free(delta_node.delta_data)
+                delta_node.delta_data = value_segment
+            else:
+                # 创建一个新的 delta 节点
+                new_delta_node = TreeNode()
+                new_delta_node.key = key_with_extra # 存储完整的 key (token + extra_key)
+                new_delta_node.delta_data = value_segment
+                new_delta_node.base_node = node
+                node.delta_node[extra_key] = new_delta_node
 
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""
