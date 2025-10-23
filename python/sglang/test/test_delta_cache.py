@@ -135,15 +135,86 @@ def test2():
         traceback.print_exc()
 
 def test3():
-    tree = RadixCache(None, None, page_size=1, disable=False, enable_delta_cache=True)
-    tree.insert(RadixKey(token_ids=[1, 2, 3, 4, 5], extra_key='lora_B'), torch.tensor([11, 22, 33, 44, 55]))
-    tree.insert(RadixKey(token_ids=[1, 2, 3], extra_key='lora_A'), torch.tensor([10, 20, 30]))
+    # 这个 case 会验证插入顺序是否会影响结果
+    # --- Corner Case 2 (Test 3): Order Invariance ---
+    print("--- Test Corner Case 2 (Test 3): Order Invariance ---")
     
+    # --- Test 3a: Insert 'short' key, then 'long' key (The Buggy Case) ---
+    print("\n--- Test 3a: short (B) then long (A) ---")
+    tree_A = RadixCache(None, None, page_size=1, disable=False, enable_delta_cache=True)
 
-    tree.pretty_print()
+    val_B = torch.tensor([11, 22, 33])
+    tree_A.insert(RadixKey(token_ids=[1, 2, 3], extra_key='lora_B'), val_B)
+    
+    val_A = torch.tensor([10, 20, 30, 40, 50])
+    tree_A.insert(RadixKey(token_ids=[1, 2, 3, 4, 5], extra_key='lora_A'), val_A)
+    
+    tree_A.pretty_print()
 
+    # 验证状态 (A)
+    try:
+        node_123 = tree_A.root_node.children[1]
+        node_45 = node_123.children[4]
+        
+        print("Verifying Test 3a:")
+        # 验证 Node(1,2,3)
+        assert node_123.key.token_ids == [1, 2, 3]
+        assert node_123.is_base and node_123.key.extra_key == 'lora_B'
+        assert node_123.value.tolist() == [11, 22, 33]
+        assert 'lora_A' in node_123.delta_node
+        assert node_123.delta_node['lora_A'].delta_data.tolist() == [10, 20, 30]
 
-    print(123)
+        # 验证 Node(4,5)
+        assert node_45.key.token_ids == [4, 5]
+        assert node_45.is_base and node_45.key.extra_key == 'lora_A'
+        assert node_45.value.tolist() == [40, 50]
+        assert not node_45.delta_node # No deltas here
+        
+        print("  Test 3a PASSED (short-then-long is correct)\n")
+
+    except Exception as e:
+        print(f"  Test 3a FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # --- Test 3b: Insert 'long' key, then 'short' key (The Working Case) ---
+    print("\n--- Test 3b: long (C) then short (D) ---")
+    tree_B = RadixCache(None, None, page_size=1, disable=False, enable_delta_cache=True)
+
+    val_C = torch.tensor([100, 200, 300, 400, 500])
+    tree_B.insert(RadixKey(token_ids=[6, 7, 8, 9, 10], extra_key='lora_C'), val_C)
+    
+    val_D = torch.tensor([111, 222, 333])
+    tree_B.insert(RadixKey(token_ids=[6, 7, 8], extra_key='lora_D'), val_D)
+
+    tree_B.pretty_print()
+
+    # 验证状态 (B)
+    try:
+        # (This case triggers a split)
+        node_678 = tree_B.root_node.children[6]
+        node_910 = node_678.children[9]
+
+        print("Verifying Test 3b:")
+        # 验证 Node(6,7,8)
+        assert node_678.key.token_ids == [6, 7, 8]
+        assert node_678.is_base and node_678.key.extra_key == 'lora_C'
+        assert node_678.value.tolist() == [100, 200, 300]
+        assert 'lora_D' in node_678.delta_node
+        assert node_678.delta_node['lora_D'].delta_data.tolist() == [111, 222, 333]
+        
+        # 验证 Node(9,10)
+        assert node_910.key.token_ids == [9, 10]
+        assert node_910.is_base and node_910.key.extra_key == 'lora_C'
+        assert node_910.value.tolist() == [400, 500]
+        assert not node_910.delta_node # No deltas here
+        
+        print("  Test 3b PASSED (long-then-short is correct)\n")
+        
+    except Exception as e:
+        print(f"  Test 3b FAILED: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":

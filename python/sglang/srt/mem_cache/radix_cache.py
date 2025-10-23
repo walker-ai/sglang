@@ -725,9 +725,7 @@ class RadixCache(BasePrefixCache):
         if len(key) == 0:
             return 0
 
-        child_key = self.get_child_key_fn(key) # token-only key
-        
-        # 我们需要保留原始的 key 和 value 以便 store
+        child_key = self.get_child_key_fn(key) 
         original_key = key
         original_value = value
 
@@ -736,7 +734,6 @@ class RadixCache(BasePrefixCache):
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
             
-            # key_match_fn 也是 token-only
             prefix_len = self.key_match_fn(node.key, key)
             
             if prefix_len < len(node.key):
@@ -749,25 +746,34 @@ class RadixCache(BasePrefixCache):
                 return total_prefix_length + prefix_len
 
             # --- Case B: 完美匹配节点，继续 ---
+            
+            # ******** 关键修复 ********
+            # 我们刚刚完美匹配了 'node'。我们 *必须* 在此节点上存储
+            # 我们的 (extra_key, value) 版本。
+            self._store_value_in_node(node, original_key, original_value)
+            # **************************
+
             total_prefix_length += prefix_len
             key = key[prefix_len:]
-            value = value[prefix_len:]
+            # (我们不再需要切片 'value' 循环变量)
 
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
         if len(key) == 0:
-            # --- Case C: 完美匹配路径 (key 是某个节点的精确前缀) ---
-            # (例如，插入 [1,2,3,4,5] for lora_B)
-            # node 是路径的最后一个节点 (Node_12345)
-            self._store_value_in_node(node, original_key, original_value)
+            # --- Case C: 完美匹配路径 ---
+            # (例如，插入 [1,2,3] for lora_B, 
+            # 此时 [1,2,3] for lora_A 已存在)
+            # _store_value_in_node 已经在 Case B 的
+            # *最后一次* 循环中被调用了。
+            # 所以这里什么都不用做。
             return total_prefix_length
         else:
             # --- Case D: 匹配在节点边界停止 (需要添加新子节点) ---
-            # (例如，第一次插入 [1,2,3,4,5] for lora_A)
+            # (例如，我们匹配了 [1,2,3], 现在需要添加 [4,5])
             new_node = TreeNode()
-            new_node.parent = node # node 是 Node_Root
-            new_node.key = key # key 是 [1,2,3,4,5]
+            new_node.parent = node 
+            new_node.key = key # 剩余的 key [4, 5]
             
             # 存储
             self._store_value_in_node(new_node, original_key, original_value)
@@ -777,44 +783,73 @@ class RadixCache(BasePrefixCache):
             self._record_store_event(new_node)
             return total_prefix_length
     
-    def _store_value_in_node(self, node: TreeNode, key_with_extra: RadixKey, value_segment: torch.Tensor):
+    def _store_value_in_node(self, node: TreeNode, key_with_extra: RadixKey, original_value: torch.Tensor):
         """
         在给定的 token 节点上存储特定 extra_key 的 value。
         """
         if not self.enable_delta_cache:
-             node.value = value_segment # 旧逻辑
+             # _insert_helper_legacy 传入了正确的切片
+             node.value = original_value
              return
 
         extra_key = key_with_extra.extra_key
 
+        # --- 计算此节点在树中的 token 范围 ---
+        # 1. 收集从当前节点到 root 的路径
+        end_pos = 0
+        temp_node = node
+        nodes_path = []
+        while temp_node.parent is not None:
+            nodes_path.append(temp_node)
+            temp_node = temp_node.parent
+        
+        # 2. 从 root 向下累加长度，计算此节点的 [start:end]
+        end_pos = sum(len(n.key) for n in reversed(nodes_path))
+        start_pos = end_pos - len(node.key)
+        
+        # 3. 检查边界 (例如，插入 [1,2,3] 时，original_value 长度为 3)
+        if start_pos >= len(original_value):
+            # 这意味着此节点 (例如 Node_45) 超出了
+            # 正在插入的 key (例如 [1,2,3]) 的范围。
+            # 我们不应该在这里存储任何东西。
+            return 
+        
+        # 确保 end_pos 不会越界
+        end_pos = min(end_pos, len(original_value))
+        
+        # --- 获得了正确的切片 ---
+        value_segment = original_value[start_pos : end_pos]
+        key_segment = key_with_extra[start_pos : end_pos]
+
+        # 如果切片为空 (例如，插入 [1,2,3] 时，Node_45 的 start_pos=3, end_pos=3)
+        if len(value_segment) == 0:
+            return
+
         # Case 1: 节点是空的 (没有 base)，将其设为 base
         if not node.is_base:
             node.is_base = True
-            # new_node.key 已经在 _insert_helper (Case C) 或 _split_node 中设置
-            # 我们只需要存储 extra_key 来标识 base
             node.key.extra_key = extra_key 
             node.value = value_segment
         
         # Case 2: 插入的 extra_key 与 base 相同 (覆盖 base)
         elif node.key.extra_key == extra_key:
-            # 释放旧的 base value
             if node.value is not None:
-                # self.token_to_kv_pool_allocator.free(node.value)
+                # TODO: self.token_to_kv_pool_allocator.free(node.value)
                 pass
+                
             node.value = value_segment
         
         # Case 3: 插入的 extra_key 是一个新的 "delta"
         else:
             delta_node = node.delta_node.get(extra_key)
             if delta_node:
-                # 覆盖已有的 delta
                 if delta_node.delta_data is not None:
                     self.token_to_kv_pool_allocator.free(delta_node.delta_data)
                 delta_node.delta_data = value_segment
+                delta_node.key = key_segment # 更新 key
             else:
-                # 创建一个新的 delta 节点
                 new_delta_node = TreeNode()
-                new_delta_node.key = key_with_extra # 存储完整的 key (token + extra_key)
+                new_delta_node.key = key_segment # Sotre *this slice's* key
                 new_delta_node.delta_data = value_segment
                 new_delta_node.base_node = node
                 node.delta_node[extra_key] = new_delta_node
