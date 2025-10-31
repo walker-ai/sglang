@@ -28,6 +28,7 @@ from functools import lru_cache, partial
 from typing import TYPE_CHECKING, Iterator, List, Optional, Tuple, Union
 
 import torch
+import numpy as np
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
@@ -45,6 +46,14 @@ from sglang.srt.mem_cache.evict_policy import (
     MRUStrategy,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+
+from sglang.srt.lora_diff.pysz import SZ
+import sys
+lib_extension = {
+    "darwin": "libSZ3c.dylib",
+    "windows": "SZ3c.dll",
+}.get(sys.platform, "libSZ3c.so")
+sz = SZ("/home/walker/workspace/SZ3/install/lib/{}".format(lib_extension))
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -103,7 +112,8 @@ class TreeNode:
         self.base_node: Optional[TreeNode] = None  # 存储差分节点所依赖的基础节点映射
         self.delta_node: Dict[str, TreeNode] = {}  # 存储所有差分节点 {extra_key: node}  
         self.is_base: bool = False  # 标记是否为基础节点 
-        self.delta_data: Optional[torch.Tensor] = None  # 存储差分数据（如果是差分节点）
+        
+        self.delta_data: Optional[tuple] = None  # <-- 新的 (将存储 e.g., (handle_K_list, handle_V_list, "diff_list"))
 
     @property
     def evicted(self):
@@ -237,6 +247,10 @@ class RadixCache(BasePrefixCache):
         if enable_delta_cache:
             self.key_match_fn = _key_match_token_only
             self.get_child_key_fn = get_child_key_token_only
+
+            self.delta_data_pool: Dict[int, np.ndarray] = {}
+            
+            self.delta_data_counter: int = 0
         else:
             if self.page_size == 1:
                 self.key_match_fn = _key_match_page_size1
@@ -589,6 +603,101 @@ class RadixCache(BasePrefixCache):
 
         _dfs_helper(self.root_node)
         return torch.cat(values)
+    
+    def store_in_delta_pool(self, compressed_data) -> int:
+        """
+        (新增) 将压缩数据存入 "新区域" (delta_data_pool)
+        并返回一个唯一的 handle (int)。
+        """
+        # 1. 获取当前的计数器值作为此数据的唯一 handle
+        handle = self.delta_data_counter
+        # 2. 将压缩数据存储在 dict 中
+        self.delta_data_pool[handle] = compressed_data
+        # 3. 递增计数器，为下一次存储做准备
+        self.delta_data_counter += 1
+        # 4. 返回这个 handle，以便 _store_value_in_node
+        #    可以将其存储在 delta_node.delta_data 中
+        return handle
+    
+    def release_from_delta_pool(self, delta_data_tuple: tuple):
+        """(新增) 从 "新区域" 释放数据。"""
+        # (我们使用一个包含 7 个元素的元组)
+        if (delta_data_tuple is None or len(delta_data_tuple) != 7 
+            or delta_data_tuple[6] != "diff_list_v2"):
+            return 
+        
+        handle_K_list, handle_V_list, _, _, _, _, _ = delta_data_tuple
+        
+        for handle in handle_K_list + handle_V_list:
+            if handle in self.delta_data_pool:
+                del self.delta_data_pool[handle]
+
+    def compress(self, target_tensor):
+        # TODO: 实现 compress 函数
+        
+        diff_tensor = target_tensor
+        diff_numpy = diff_tensor.detach().cpu().numpy()  # 转为 NumPy 数组
+
+        diff_compressed, _ = sz.compress(diff_numpy, eb_mode=0, eb_abs=1e-3, eb_rel=0, eb_pwr=0)
+
+        diff_tensor_size = diff_tensor.numel() * diff_tensor.element_size()
+        compressed_size = diff_compressed.nbytes
+
+        return diff_compressed
+    
+    def recompute_diff(self, base_indices, delta_indices, extra_key, key_segment):
+        """
+        (新增) 核心辅助函数。
+        计算 diff, 压缩, 存入 pool, 并返回一个
+        填充了 "数据" (handles) 和 "配方" (indices) 的新 Delta 节点。
+        """
+        device = self.token_to_kv_pool_allocator.device
+        base_indices = base_indices.to(device)
+        delta_indices = delta_indices.to(device)
+
+        handle_K_list = []
+        handle_V_list = []
+        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        num_layers = len(kv_cache.k_buffer) # 假设为 32
+
+        k_shape, v_shape = None, None
+        k_dtype, v_dtype = None, None
+
+        for i in range(num_layers): 
+            base_k_buffer_layer, base_v_buffer_layer = kv_cache.k_buffer[i], kv_cache.v_buffer[i]
+
+            base_K_tensor = base_k_buffer_layer.index_select(0, base_indices)
+            base_V_tensor = base_v_buffer_layer.index_select(0, base_indices)
+            delta_K_tensor = base_k_buffer_layer.index_select(0, delta_indices)
+            delta_V_tensor = base_v_buffer_layer.index_select(0, delta_indices)
+
+            diff_K = delta_K_tensor - base_K_tensor
+            diff_V = delta_V_tensor - base_V_tensor
+
+            if i == 0:
+                k_shape, k_dtype = diff_K.shape, diff_K.dtype
+                v_shape, v_dtype = diff_V.shape, diff_V.dtype
+
+            compressed_K_np = self.compress(diff_K)
+            compressed_V_np = self.compress(diff_V)
+            
+            handle_K_list.append(self.store_in_delta_pool(compressed_K_np))
+            handle_V_list.append(self.store_in_delta_pool(compressed_V_np))
+
+        # 创建新节点
+        new_delta_node = TreeNode()
+        new_delta_node.key = key_segment
+        
+        # 存储 "数据" (句柄 + 元数据)
+        new_delta_node.delta_data = (
+            handle_K_list, handle_V_list, 
+            k_shape, v_shape, k_dtype, v_dtype, 
+            "diff_list_v2" # 新标签
+        )
+        # 存储 "配方" (原始索引的副本)
+        new_delta_node.value = delta_indices.cpu() 
+        
+        return new_delta_node
 
     ##### Internal Helper Functions #####
 
@@ -618,61 +727,73 @@ class RadixCache(BasePrefixCache):
         return value, node
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
-        # new_node -> child
+        """
+        (完整) 将一个节点分裂为前缀 (new_node) 和后缀 (child)。
+        """
+        # --- 1. 基础设置 (与旧版相同) ---
         self._record_remove_event(child)
         new_node = TreeNode()
         new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
-        new_node.key = child.key[:split_len] # new_node 是前缀
-        
-        # 预先设置 child.key (后缀)
+        new_node.key = child.key[:split_len] 
         child_key_suffix = child.key[split_len:]
         
-        # --- 差分缓存分裂逻辑 ---
+        # --- 2. 差分缓存分裂逻辑 ---
         if self.enable_delta_cache:
-            # 1. Base 版本分裂
+            
+            # --- 2a. Base 版本分裂 (保持不变) ---
             if child.is_base:
                 new_node.is_base = True
-                new_node.value = child.value[:split_len] # 前缀 value
-                child.value = child.value[split_len:]      # 后缀 value
-                # 确保 new_node 的 key 也存储了 base extra_key
+                new_node.value = child.value[:split_len] # Base 前缀索引 (配方)
+                child.value = child.value[split_len:]    # Base 后缀索引 (配方)
                 new_node.key.extra_key = child.key.extra_key
             
-            # 2. Delta 版本分裂
+            # --- 2b. Delta 版本分裂 (!! 核心重构 !!) ---
             new_node.delta_node = {}
-            suffix_delta_nodes = {} # <--- 为 child (后缀) 创建新的 delta 字典
+            suffix_delta_nodes = {} 
             
             for extra_key, delta_node in child.delta_node.items():
-                # 为 new_node (前缀) 创建一个新的 delta 节点
-                new_prefix_delta = TreeNode()
-                new_prefix_delta.key = delta_node.key[:split_len] # <--- 修正: delta key 也分裂
-                new_prefix_delta.key.extra_key = delta_node.key.extra_key
                 
-                new_prefix_delta.delta_data = delta_node.delta_data[:split_len]
-                new_prefix_delta.base_node = new_node
-                new_node.delta_node[extra_key] = new_prefix_delta
+                # i. 释放旧的、无效的 Diff 数据 (句柄)
+                self.release_from_delta_pool(delta_node.delta_data)
+
+                # ii. 获取“配方”(原始 Delta 索引)
+                original_delta_indices = delta_node.value
                 
-                # 为 child (后缀) 更新 *现有的* delta_node
-                delta_node.key = delta_node.key[split_len:] # <--- 修正: delta key 也分裂
-                delta_node.delta_data = delta_node.delta_data[split_len:]
-                delta_node.base_node = child # 指向新的后缀 base 节点
-                
-                # <--- 修正: 如果后缀 delta 不为空，则添加到新字典
-                if len(delta_node.delta_data) > 0:
-                    suffix_delta_nodes[extra_key] = delta_node
+                # iii. 切片“配方” (Tensor 切片)
+                prefix_delta_indices = original_delta_indices[:split_len]
+                suffix_delta_indices = original_delta_indices[split_len:]
+
+                # iv. 重新计算并存储 "前缀" Diff
+                if len(prefix_delta_indices) > 0 and new_node.value is not None:
+                    new_prefix_delta = self.recompute_diff(
+                        new_node.value, prefix_delta_indices, 
+                        extra_key, delta_node.key[:split_len]
+                    )
+                    new_prefix_delta.base_node = new_node
+                    new_node.delta_node[extra_key] = new_prefix_delta
+
+                # v. 重新计算并存储 "后缀" Diff
+                if len(suffix_delta_indices) > 0 and child.value is not None:
+                    new_suffix_delta = self.recompute_diff(
+                        child.value, suffix_delta_indices,
+                        extra_key, delta_node.key[split_len:]
+                    )
+                    new_suffix_delta.base_node = child
+                    suffix_delta_nodes[extra_key] = new_suffix_delta
             
-            # 3. 将 child 上的 delta 更新为仅包含后缀的字典
             child.delta_node = suffix_delta_nodes
             
         else:
-            # --- 旧的非差分逻辑 ---
+            # --- 旧的非差分逻辑 (保持不变) ---
             new_node.value = child.value[:split_len]
             child.value = child.value[split_len:]
         # --- 结束 ---
 
+        # --- 3. 收尾 (与旧版相同) ---
         child.parent = new_node
-        child.key = child_key_suffix # 在最后设置 child.key
+        child.key = child_key_suffix 
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
 
         self._record_store_event(new_node)
@@ -785,74 +906,67 @@ class RadixCache(BasePrefixCache):
     
     def _store_value_in_node(self, node: TreeNode, key_with_extra: RadixKey, original_value: torch.Tensor):
         """
-        在给定的 token 节点上存储特定 extra_key 的 value。
+        (完整) 在给定的 token 节点上存储特定 extra_key 的 value。
         """
         if not self.enable_delta_cache:
-             # _insert_helper_legacy 传入了正确的切片
              node.value = original_value
              return
 
         extra_key = key_with_extra.extra_key
 
-        # --- 计算此节点在树中的 token 范围 ---
-        # 1. 收集从当前节点到 root 的路径
+        # --- 1. 计算切片 (与您之前的代码相同) ---
         end_pos = 0
         temp_node = node
         nodes_path = []
         while temp_node.parent is not None:
             nodes_path.append(temp_node)
             temp_node = temp_node.parent
-        
-        # 2. 从 root 向下累加长度，计算此节点的 [start:end]
         end_pos = sum(len(n.key) for n in reversed(nodes_path))
         start_pos = end_pos - len(node.key)
-        
-        # 3. 检查边界 (例如，插入 [1,2,3] 时，original_value 长度为 3)
         if start_pos >= len(original_value):
-            # 这意味着此节点 (例如 Node_45) 超出了
-            # 正在插入的 key (例如 [1,2,3]) 的范围。
-            # 我们不应该在这里存储任何东西。
             return 
-        
-        # 确保 end_pos 不会越界
         end_pos = min(end_pos, len(original_value))
-        
-        # --- 获得了正确的切片 ---
         value_segment = original_value[start_pos : end_pos]
         key_segment = key_with_extra[start_pos : end_pos]
-
-        # 如果切片为空 (例如，插入 [1,2,3] 时，Node_45 的 start_pos=3, end_pos=3)
         if len(value_segment) == 0:
             return
 
+        # --- 2. 存储逻辑 ---
+        
         # Case 1: 节点是空的 (没有 base)，将其设为 base
         if not node.is_base:
             node.is_base = True
             node.key.extra_key = extra_key 
-            node.value = value_segment
+            node.value = value_segment # Base 存储 *索引* (Tensor)
         
-        # Case 2: 插入的 extra_key 与 base 相同 (覆盖 base)
+        # Case 2: 插入的 extra_key 与 base 相同 (相同的不进行覆盖 base)
         elif node.key.extra_key == extra_key:
-            if node.value is not None:
-                # TODO: self.token_to_kv_pool_allocator.free(node.value)
-                pass
-                
-            node.value = value_segment
+            if node.value is not None and not torch.equal(node.value, value_segment):
+                self.token_to_kv_pool_allocator.free(node.value)
+                node.value = value_segment # 存储新的 Base 索引
+            elif node.value is None:
+                node.value = value_segment
         
         # Case 3: 插入的 extra_key 是一个新的 "delta"
         else:
-            delta_node = node.delta_node.get(extra_key)
-            if delta_node:
-                if delta_node.delta_data is not None:
-                    self.token_to_kv_pool_allocator.free(delta_node.delta_data)
-                delta_node.delta_data = value_segment
-                delta_node.key = key_segment # 更新 key
-            else:
-                new_delta_node = TreeNode()
-                new_delta_node.key = key_segment # Sotre *this slice's* key
-                new_delta_node.delta_data = value_segment
-                new_delta_node.base_node = node
-                node.delta_node[extra_key] = new_delta_node
+            base_indices = node.value    # Base 配方
+            delta_indices = value_segment # Delta 配方
+
+            # --- 3a. 调用 recompute_diff ---
+            new_delta_node = self.recompute_diff(
+                base_indices, delta_indices, extra_key, key_segment
+            )
+            
+            # --- 3b. 将新节点插入 delta_node 字典 ---
+            existing_delta_node = node.delta_node.get(extra_key)
+            if existing_delta_node:
+                self.release_from_delta_pool(existing_delta_node.delta_data) # 释放旧 handle
+            
+            new_delta_node.base_node = node
+            node.delta_node[extra_key] = new_delta_node
+            
+            # --- 3c. (!! 关键 !!) 释放 Delta 的 *原始* 索引 ---
+            self.token_to_kv_pool_allocator.free(delta_indices)
 
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""
