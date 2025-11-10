@@ -53,7 +53,7 @@ lib_extension = {
     "darwin": "libSZ3c.dylib",
     "windows": "SZ3c.dll",
 }.get(sys.platform, "libSZ3c.so")
-sz = SZ("/home/walker/workspace/SZ3/install/lib/{}".format(lib_extension))
+sz = SZ("/home/wangyitao/tools/SZ3/install/lib/{}".format(lib_extension))
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -249,6 +249,7 @@ class RadixCache(BasePrefixCache):
             self.get_child_key_fn = get_child_key_token_only
 
             self.delta_data_pool: Dict[int, np.ndarray] = {}
+            self.total_delta_bytes = 0
             
             self.delta_data_counter: int = 0
         else:
@@ -353,16 +354,46 @@ class RadixCache(BasePrefixCache):
         if len(key) == 0:
             return empty_match_result()
 
-        value, last_node = self._match_prefix_helper(self.root_node, key)
-        if value:
-            value = torch.cat(value)
+        # --- (!! 核心修改 !!) ---
+        
+        # 1. 收集重建信息
+        #    collected_segments_info: List[tuple(data, type, metadata)]
+        collected_segments_info, last_node = self._match_prefix_helper(self.root_node, key)
+
+        if not collected_segments_info:
+            # 没有匹配到任何片段
+            return MatchResult(
+                device_indices=torch.empty((0,), dtype=torch.int64, device=self.device),
+                last_device_node=last_node,
+                last_host_node=last_node,
+            )
+
+        # 2. 处理片段 (重建或直接使用)
+        final_indices_list = []
+        for segment_info in collected_segments_info:
+            # segment_info[1] 是 "type" ("base" 或 "delta")
+            if segment_info[1] == "base":
+                # 'data' (segment_info[0]) 已经是索引
+                final_indices_list.append(segment_info[0])
+            elif segment_info[1] == "delta":
+                # 'data' 是句柄元组, 'metadata' 是 base 索引
+                # 调用重建函数
+                newly_allocated_indices = self._reconstruct_and_alloc(segment_info)
+                
+                if newly_allocated_indices is None:
+                    # 重建失败 (例如 OOM)
+                    # 停止匹配, 只返回到此为止的索引
+                    break 
+                
+                final_indices_list.append(newly_allocated_indices)
+        
+        # 3. 组装最终结果
+        if final_indices_list:
+            value = torch.cat(final_indices_list)
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
 
-        # # 如果启用了差分缓存，且没有找到完全匹配
-        # if kwargs['enable_delta_cache'] is True and len(value) < len(key):
-        #     # 尝试查找相同 token 序列但是不同 extra_key 的基础节点
-        #     pass
+        # --- (结束核心修改) ---
 
         return MatchResult(
             device_indices=value,
@@ -613,6 +644,7 @@ class RadixCache(BasePrefixCache):
         handle = self.delta_data_counter
         # 2. 将压缩数据存储在 dict 中
         self.delta_data_pool[handle] = compressed_data
+        self.total_delta_bytes += compressed_data.shape[0]
         # 3. 递增计数器，为下一次存储做准备
         self.delta_data_counter += 1
         # 4. 返回这个 handle，以便 _store_value_in_node
@@ -630,8 +662,9 @@ class RadixCache(BasePrefixCache):
         
         for handle in handle_K_list + handle_V_list:
             if handle in self.delta_data_pool:
+                self.total_delta_bytes -= self.delta_data_pool[handle].shape[0]
                 del self.delta_data_pool[handle]
-
+                
     def compress(self, target_tensor):
         # TODO: 实现 compress 函数
         
@@ -644,6 +677,13 @@ class RadixCache(BasePrefixCache):
         compressed_size = diff_compressed.nbytes
 
         return diff_compressed
+    
+    def decompress(self, compressed_diff, shape, dtype) -> torch.Tensor:
+        decompressed_diff = sz.decompress(compressed_diff, shape, original_dtype=dtype)
+
+        # 转为 torch 张量
+        decompressed_diff = torch.from_numpy(decompressed_diff).to('cuda') 
+        return decompressed_diff
     
     def recompute_diff(self, base_indices, delta_indices, extra_key, key_segment):
         """
@@ -701,7 +741,7 @@ class RadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
-    def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
+    def _match_prefix_helper_legacy(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
 
         child_key = self.get_child_key_fn(key)
@@ -725,6 +765,63 @@ class RadixCache(BasePrefixCache):
                     child_key = self.get_child_key_fn(key)
 
         return value, node
+    
+    def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
+        """
+        (新增) 遍历树, 收集重建所需的信息片段。
+        """
+        if not self.enable_delta_cache:
+            value_list, last_node = self._match_prefix_helper_legacy(node, key)
+            # 转换格式以匹配新输出
+            collected_segments_info = [(val, "base", None) for val in value_list]
+            return collected_segments_info, last_node
+
+        # --- 新的差分逻辑 ---
+        node.last_access_time = time.monotonic()
+        request_extra_key = key.extra_key
+        search_key = key
+        child_key = self.get_child_key_fn(search_key) # token-only
+
+        collected_segments_info = [] # 存储 (data, type, metadata) 元组
+        last_node = node # 跟踪 token 路径的末端
+        extra_key_matched = True
+
+        while len(search_key) > 0 and child_key in node.children.keys():
+            child = node.children[child_key]
+            child.last_access_time = time.monotonic()
+            last_node = child # 总是更新 last_node 到 token 路径的末端
+
+            prefix_len = self.key_match_fn(child.key, search_key)
+
+            if prefix_len < len(child.key):
+                # --- 分裂情况 ---
+                new_split_node = self._split_node(child.key, child, prefix_len)
+                last_node = new_split_node # Token 路径在此结束
+
+                if extra_key_matched:
+                    segment_info = self._get_value_for_key(new_split_node, request_extra_key)
+                    data, type, metadata = segment_info
+                    if type == "miss":
+                        extra_key_matched = False
+                    else:
+                        collected_segments_info.append(segment_info)
+                break
+            else:
+                # --- 完整节点匹配情况 ---
+                if extra_key_matched:
+                    segment_info = self._get_value_for_key(child, request_extra_key)
+                    data, type, metadata = segment_info
+                    if type == "miss":
+                        extra_key_matched = False
+                    else:
+                        collected_segments_info.append(segment_info)
+
+                node = child
+                search_key = search_key[prefix_len:]
+                if len(search_key):
+                    child_key = self.get_child_key_fn(search_key)
+
+        return collected_segments_info, last_node
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         """
@@ -967,6 +1064,122 @@ class RadixCache(BasePrefixCache):
             
             # --- 3c. (!! 关键 !!) 释放 Delta 的 *原始* 索引 ---
             self.token_to_kv_pool_allocator.free(delta_indices)
+
+    def _get_value_for_key(self, node: TreeNode, extra_key: Optional[str]) -> tuple:
+        """
+        (新增) 获取重建所需的信息。
+        返回: tuple (data, type, metadata)
+          - type="base": data=indices (Tensor), metadata=None
+          - type="delta": data=delta_data_tuple, metadata=base_indices (Tensor)
+          - type="miss": data=None, metadata=None
+        """
+        if not self.enable_delta_cache:
+            # 旧逻辑: 只返回索引或 None
+            return (node.value, "base" if node.value is not None else "miss", None)
+
+        # --- 新的差分逻辑 ---
+        
+        # Case 1: 请求的 extra_key 匹配 Base
+        if node.is_base and node.key.extra_key == extra_key:
+            if node.value is not None:
+                return (node.value, "base", None)
+            else:
+                return (None, "miss", None) 
+
+        # Case 2: 请求的 extra_key 匹配一个 Delta
+        delta_node = node.delta_node.get(extra_key)
+        if delta_node:
+            # 检查 delta_data 是否是我们期望的格式
+            if (delta_node.delta_data and isinstance(delta_node.delta_data, tuple)
+                and delta_node.delta_data[6] == "diff_list_v2"):
+                
+                # 我们需要 Base 节点的索引来进行重建
+                base_indices = node.value # Base 节点的索引存储在 .value
+                if base_indices is None:
+                     print(f"WARNING: Delta found for {extra_key} but base node {node.id} has no value!")
+                     return (None, "miss", None)
+
+                # 返回: (句柄元组, "delta", Base的索引)
+                return (delta_node.delta_data, "delta", base_indices)
+            else:
+                print(f"WARNING: Delta node {delta_node.id} for {extra_key} has invalid delta_data!")
+                return (None, "miss", None)
+
+        # Case 3: Miss. Token 路径匹配了, 但此 LoRA 在此节点无数据
+        return (None, "miss", None)
+    
+    def _reconstruct_and_alloc(self, segment_info: tuple) -> Optional[torch.Tensor]:
+        """
+        (新增) 核心重建函数。
+        接收来自 _get_value_for_key 的 ("delta", ...) 元组,
+        执行 32 层解压、重建、分配新槽位并复制。
+        返回 *新分配的索引* (Tensor)。
+        """
+        data, type, metadata = segment_info
+
+        # Case 1: 如果是 Base, 无需重建, 直接返回索引
+        if type == "base":
+            return data # data 已经是索引 (Tensor)
+        
+        # Case 2: 如果是 Miss, 返回 None
+        if type == "miss":
+            return None
+            
+        # Case 3: 如果是 Delta, 执行重建
+        if type == "delta":
+            delta_data_tuple = data
+            base_indices = metadata # Base 的 "配方"
+            
+            # --- 3a. 解析句柄和元数据 ---
+            (handle_K_list, handle_V_list, 
+             k_shape, v_shape, k_dtype, v_dtype, 
+             _) = delta_data_tuple
+
+            # --- 3b. 分配新槽位 (在主 KV Pool 中) ---
+            # 我们需要为重建的数据分配空间。
+            # 数量由 k_shape[0] (即 token 数量) 决定。
+            num_tokens_to_alloc = k_shape[0]
+            if num_tokens_to_alloc == 0:
+                return torch.tensor([], dtype=torch.int64, device=self.device)
+                
+            new_indices = self.token_to_kv_pool_allocator.alloc(num_tokens_to_alloc)
+            if new_indices is None:
+                print(f"WARNING: KV Pool OOM. Failed to allocate {num_tokens_to_alloc} slots for reconstruction.")
+                return None # 分配失败
+
+            # --- 3c. 循环 32 层进行重建和复制 ---
+            kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+            num_layers = len(kv_cache.k_buffer) # 32
+            
+            base_indcies = base_indices.to(self.device)
+
+            for i in range(num_layers):
+                # i. 获取 Base KV 张量
+                base_K_tensor = kv_cache.k_buffer[i].index_select(0, base_indices)
+                base_V_tensor = kv_cache.v_buffer[i].index_select(0, base_indices)
+                
+                # ii. 获取并解压 Diff K
+                handle_K = handle_K_list[i]
+                compressed_K_np = self.delta_data_pool[handle_K]
+                diff_K = self.decompress(compressed_K_np, base_K_tensor.shape, np.float32)
+                
+                # iii. 获取并解压 Diff V
+                handle_V = handle_V_list[i]
+                compressed_V_np = self.delta_data_pool[handle_V]
+                diff_V = self.decompress(compressed_V_np, base_V_tensor.shape, np.float32)
+                
+                # iv. 重建
+                reconstructed_K = base_K_tensor + diff_K
+                reconstructed_V = base_V_tensor + diff_V
+                
+                # v. 复制 (Scatter) 到新分配的槽位
+                kv_cache.k_buffer[i].index_copy_(0, new_indices, reconstructed_K)
+                kv_cache.v_buffer[i].index_copy_(0, new_indices, reconstructed_V)
+
+            # --- 3d. 返回新分配的索引 ---
+            return new_indices
+            
+        return None # 不应到达这里
 
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""

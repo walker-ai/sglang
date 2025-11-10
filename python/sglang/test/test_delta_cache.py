@@ -37,8 +37,8 @@ class MockKVCache:
         self.k_buffer = []
         self.v_buffer = []
         for _ in range(NUM_LAYERS):
-            self.k_buffer.append(torch.randn(num_tokens, 8, 128, device=device))
-            self.v_buffer.append(torch.randn(num_tokens, 8, 128, device=device))
+            self.k_buffer.append(torch.zeros(num_tokens, 8, 128, device=device))
+            self.v_buffer.append(torch.zeros(num_tokens, 8, 128, device=device))
 
 # (假设 TokenToKVPoolAllocator 已定义)
 # class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator): ...
@@ -552,10 +552,85 @@ def test_simple_diff_compression():
         import traceback
         traceback.print_exc()
 
+# (确保 MockKVCache 和 TokenToKVPoolAllocator 类已在顶部定义)
+
+def test_match_reconstruction():
+    print("\n--- Test Step 4 (Match): Verify End-to-End Reconstruction ---")
+
+    # --- 1. 设置 ---
+    allocator = TokenToKVPoolAllocator(
+        size=1000, dtype=torch.float16, device=device,
+        kvcache=MockKVCache(1000), need_sort=False
+    )
+    val_A = torch.tensor([10, 11, 12], device=device, dtype=torch.int64)
+    val_B = torch.tensor([20, 21, 22], device=device, dtype=torch.int64)
+    
+    # 手动从 free_pages 中移除 (模拟 A 和 B 已分配)
+    indices_in_use_cpu = torch.cat([val_A, val_B]).cpu().unique()
+    mask = torch.isin(allocator.free_pages.cpu(), indices_in_use_cpu)
+    allocator.free_pages = allocator.free_pages[~mask.to(device)]
+    
+    # 记录 free_pages 的初始状态
+    initial_free_pages = allocator.free_pages.clone()
+    print(f"  Allocator setup. Initial available: {allocator.available_size()}")
+
+    tree = RadixCache(None, allocator, page_size=1, disable=False, enable_delta_cache=True)
+
+    # --- 2. 插入 Base 'A' 和 Delta 'B' ---
+    tree.insert(RadixKey(token_ids=[1, 2, 3], extra_key='lora_A'), val_A)
+    tree.insert(RadixKey(token_ids=[1, 2, 3], extra_key='lora_B'), val_B) # B 会被压缩, val_B 会被 free
+
+    # 验证 val_B 是否已被释放
+    assert torch.all(torch.isin(val_B, allocator.free_pages))
+    # 验证 val_A 是否未被释放
+    assert not torch.all(torch.isin(val_A, allocator.free_pages))
+    print("\n  Insert complete. 'val_B' indices freed: PASSED")
+    
+    # 记录 free() 后的 free_pages 状态
+    pages_after_free = allocator.free_pages.clone()
+
+    # --- 3. 调用 match_prefix (重建 Delta 'B') ---
+    print("\nCalling match_prefix for 'lora_B' (triggers reconstruction)...")
+    key_B = RadixKey(token_ids=[1, 2, 3, 4], extra_key='lora_B')
+    match_result = tree.match_prefix(key_B)
+    
+    reconstructed_indices = match_result.device_indices
+    print(f"  match_prefix returned indices: {reconstructed_indices.tolist()}")
+    
+    # --- 4. 验证 ---
+    try:
+        # 验证返回的索引长度是否正确
+        assert len(reconstructed_indices) == len(val_B)
+        
+        # (!! 关键 !!) 验证返回的索引 *不是* val_A 或 val_B
+        assert not torch.equal(reconstructed_indices, val_A)
+        assert not torch.equal(reconstructed_indices, val_B)
+        print("  Reconstructed indices are new (not A or B): PASSED")
+        
+        # (!! 关键 !!) 验证新索引是否是从 free_pages 中分配的
+        # (即，它们现在 *不* 应该在 free_pages 列表中)
+        assert not torch.all(torch.isin(reconstructed_indices, allocator.free_pages))
+        print("  New indices were correctly allocated from free_pages: PASSED")
+        
+        # (!! 关键 !!) 验证 val_B (在 free 之后) 是否被 *重新分配*
+        # (即，新索引 *可能* 与 val_B 相同，因为 val_B 是可用的)
+        # 这是一个更强的检查：
+        assert torch.all(torch.isin(reconstructed_indices, pages_after_free))
+        print("  New indices came from the pool available after free(val_B): PASSED")
+
+        print("\nStep 4 (End-to-End Match) Test PASSED!")
+
+    except Exception as e:
+        print(f"\nStep 4 (End-to-End Match) Test FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+    
 if __name__ == "__main__":
     # test1()
     # test2()
-    test3()
+    # test3()
     # test_delta_pool_logic()
 
-    # test_simple_diff_compression()
+    # test_simple_diff_compression(
+
+    test_match_reconstruction()
