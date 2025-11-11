@@ -320,6 +320,8 @@ class ServerArgs:
     lora_eviction_policy: str = DEFAULT_LORA_EVICTION_POLICY
     lora_backend: str = "triton"
     max_lora_chunk_size: Optional[int] = 16
+    ## For MobiLoRA
+    enable_delta_cache: Optional[bool] = None
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -3364,6 +3366,14 @@ class ServerArgs:
             "--config",
             type=str,
             help="Read CLI options from a config file. Must be a YAML file with configuration options.",
+        )
+
+        # Mobilora delta cache
+        parser.add_argument(
+            "--enable-delta-cache",
+            default=ServerArgs.enable_delta_cache,
+            action="store_true",
+            help="enbale Mobilora Delta kv cache for different lora, need to enable lora",
         )
 
     @classmethod

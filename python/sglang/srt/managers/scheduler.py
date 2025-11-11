@@ -805,6 +805,7 @@ class Scheduler(
                     eviction_policy=server_args.radix_eviction_policy,
                 )
             else:
+                enable_delta_cache = server_args.enable_delta_cache
                 self.tree_cache = RadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -813,6 +814,7 @@ class Scheduler(
                     enable_kv_cache_events=self.enable_kv_cache_events,
                     eviction_policy=server_args.radix_eviction_policy,
                     is_eagle=self.spec_algorithm.is_eagle(),
+                    enable_delta_cache=enable_delta_cache,
                 )
 
         if (
