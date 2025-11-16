@@ -953,6 +953,9 @@ class RadixCache(BasePrefixCache):
             node.last_access_time = time.monotonic()
             
             prefix_len = self.key_match_fn(node.key, key)
+            total_prefix_length += prefix_len
+            key = key[prefix_len:]
+            value = value[prefix_len:]
             
             if prefix_len < len(node.key):
                 # --- Case A: 节点分裂 ---
@@ -960,8 +963,8 @@ class RadixCache(BasePrefixCache):
                 
                 # 在分裂出的新父节点上存储
                 self._store_value_in_node(new_node, original_key, original_value) 
-                
-                return total_prefix_length + prefix_len
+                node = new_node
+                # return total_prefix_length + prefix_len
 
             # --- Case B: 完美匹配节点，继续 ---
             
@@ -971,27 +974,20 @@ class RadixCache(BasePrefixCache):
             self._store_value_in_node(node, original_key, original_value)
             # **************************
 
-            total_prefix_length += prefix_len
-            key = key[prefix_len:]
+            # total_prefix_length += prefix_len
+            # key = key[prefix_len:]
             # (我们不再需要切片 'value' 循环变量)
 
             if len(key):
                 child_key = self.get_child_key_fn(key)
 
-        if len(key) == 0:
-            # --- Case C: 完美匹配路径 ---
-            # (例如，插入 [1,2,3] for lora_B, 
-            # 此时 [1,2,3] for lora_A 已存在)
-            # _store_value_in_node 已经在 Case B 的
-            # *最后一次* 循环中被调用了。
-            # 所以这里什么都不用做。
-            return total_prefix_length
-        else:
+        if len(key):
             # --- Case D: 匹配在节点边界停止 (需要添加新子节点) ---
             # (例如，我们匹配了 [1,2,3], 现在需要添加 [4,5])
             new_node = TreeNode()
             new_node.parent = node 
             new_node.key = key # 剩余的 key [4, 5]
+            new_node.value = value
             
             # 存储
             self._store_value_in_node(new_node, original_key, original_value)
@@ -999,7 +995,7 @@ class RadixCache(BasePrefixCache):
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._record_store_event(new_node)
-            return total_prefix_length
+        return total_prefix_length
     
     def _store_value_in_node(self, node: TreeNode, key_with_extra: RadixKey, original_value: torch.Tensor):
         """
@@ -1039,7 +1035,7 @@ class RadixCache(BasePrefixCache):
         # Case 2: 插入的 extra_key 与 base 相同 (相同的不进行覆盖 base)
         elif node.key.extra_key == extra_key:
             if node.value is not None and not torch.equal(node.value, value_segment):
-                self.token_to_kv_pool_allocator.free(node.value)
+                # self.token_to_kv_pool_allocator.free(node.value)
                 node.value = value_segment # 存储新的 Base 索引
             elif node.value is None:
                 node.value = value_segment
@@ -1295,11 +1291,15 @@ if __name__ == "__main__":
     tree = RadixCache(None, None, page_size=1, disable=False)
 
     # Example token id sequences (as lists of ints)
-    tree.insert(RadixKey(token_ids=[1, 2, 3], extra_key=None))
-    tree.insert(RadixKey(token_ids=[1, 2, 3], extra_key=None))
-    tree.insert(RadixKey(token_ids=[1, 2, 4, 5], extra_key=None))
-    tree.insert(RadixKey(token_ids=[1, 2, 4, 5, 6, 7], extra_key=None))
-    tree.insert(RadixKey(token_ids=[8, 9, 10, 11, 12], extra_key=None))
-    tree.pretty_print()
+    # tree.insert(RadixKey(token_ids=[1, 2, 3], extra_key=None))
+    # tree.insert(RadixKey(token_ids=[1, 2, 3], extra_key=None))
+    # tree.insert(RadixKey(token_ids=[1, 2, 4, 5], extra_key=None))
+    # tree.insert(RadixKey(token_ids=[1, 2, 4, 5, 6, 7], extra_key=None))
+    # tree.insert(RadixKey(token_ids=[8, 9, 10, 11, 12], extra_key=None))
+    # tree.pretty_print()
 
-    print(tree.match_prefix(RadixKey(token_ids=[1, 2, 3, 13, 14], extra_key=None)))
+    # print(tree.match_prefix(RadixKey(token_ids=[1, 2, 3, 13, 14], extra_key=None)))
+
+    tree.insert(RadixKey(token_ids=[1, 2, 3, 4, 5], extra_key=None))
+    print(tree.match_prefix(RadixKey(token_ids=[1, 2, 3], extra_key=None)))
+    tree.pretty_print()
