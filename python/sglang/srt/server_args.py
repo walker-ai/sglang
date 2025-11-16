@@ -321,7 +321,7 @@ class ServerArgs:
     lora_backend: str = "triton"
     max_lora_chunk_size: Optional[int] = 16
     ## For MobiLoRA
-    enable_delta_cache: Optional[bool] = None
+    enable_delta_cache: Optional[bool] = False
 
     # Kernel backend
     attention_backend: Optional[str] = None
