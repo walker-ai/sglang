@@ -1440,7 +1440,7 @@ def _execute_server_warmup(
 
     # Wait until the server is launched
     success = False
-    for _ in range(120):
+    for _ in range(1200):
         time.sleep(1)
         try:
             res = requests.get(url + "/get_model_info", timeout=5, headers=headers)
