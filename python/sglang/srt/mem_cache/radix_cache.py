@@ -191,6 +191,16 @@ def _key_match_token_only(key0: RadixKey, key1: RadixKey):
         i += 1
     return i
 
+def _key_match_extra_key(key0: RadixKey, key1: RadixKey):
+    if key0 != key1:
+        return 0
+    i = 0
+    for k0, k1 in zip(key0.token_ids, key1.token_ids):
+        if k0 != k1:
+            break
+        i += 1
+    return i
+
 def get_child_key_token_only(key: RadixKey, page_size: int = 1):
     if page_size == 1:
         return key.token_ids[0]
@@ -245,7 +255,9 @@ class RadixCache(BasePrefixCache):
             self.device = torch.device("cpu")
 
         if enable_delta_cache:
-            self.key_match_fn = _key_match_token_only
+            self.key_match_fn_token_only = _key_match_token_only
+            self.key_match_fn_extra_key = _key_match_extra_key
+            self.key_match_fn = _key_match_page_size1
             self.get_child_key_fn = get_child_key_token_only
 
             self.delta_data_pool: Dict[int, np.ndarray] = {}
@@ -673,7 +685,7 @@ class RadixCache(BasePrefixCache):
         # TODO: 实现 compress 函数
         
         diff_tensor = target_tensor
-        diff_numpy = diff_tensor.detach().cpu().numpy()  # 转为 NumPy 数组
+        diff_numpy = diff_tensor.detach().cpu().float().numpy()  # 转为 NumPy 数组
 
         diff_compressed, _ = sz.compress(diff_numpy, eb_mode=0, eb_abs=1e-3, eb_rel=0, eb_pwr=0)
 
@@ -686,7 +698,7 @@ class RadixCache(BasePrefixCache):
         decompressed_diff = sz.decompress(compressed_diff, shape, original_dtype=dtype)
 
         # 转为 torch 张量
-        decompressed_diff = torch.from_numpy(decompressed_diff).to('cuda') 
+        decompressed_diff = torch.from_numpy(decompressed_diff).to('cuda').to(torch.bfloat16)
         return decompressed_diff
     
     def recompute_diff(self, base_indices, delta_indices, extra_key, key_segment):
@@ -754,7 +766,7 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
-            prefix_len = self.key_match_fn(child.key, key)
+            prefix_len = self.key_match_fn_only(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -795,7 +807,7 @@ class RadixCache(BasePrefixCache):
             child.last_access_time = time.monotonic()
             last_node = child # 总是更新 last_node 到 token 路径的末端
 
-            prefix_len = self.key_match_fn(child.key, search_key)
+            prefix_len = self.key_match_fn_token_only(child.key, search_key)
 
             if prefix_len < len(child.key):
                 # --- 分裂情况 ---
@@ -956,8 +968,9 @@ class RadixCache(BasePrefixCache):
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
             
-            prefix_len = self.key_match_fn(node.key, key)
-            total_prefix_length += prefix_len
+            prefix_len = self.key_match_fn_token_only(node.key, key)
+            radix_prefix_len = self.key_match_fn_extra_key(node.key, key)
+            total_prefix_length += radix_prefix_len
             key = key[prefix_len:]
             value = value[prefix_len:]
             
@@ -1039,7 +1052,7 @@ class RadixCache(BasePrefixCache):
         # Case 2: 插入的 extra_key 与 base 相同 (相同的不进行覆盖 base)
         elif node.key.extra_key == extra_key:
             if node.value is not None and not torch.equal(node.value, value_segment):
-                # self.token_to_kv_pool_allocator.free(node.value)
+                self.token_to_kv_pool_allocator.free(node.value)
                 node.value = value_segment # 存储新的 Base 索引
             elif node.value is None:
                 node.value = value_segment
