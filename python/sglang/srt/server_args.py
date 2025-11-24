@@ -364,6 +364,7 @@ class ServerArgs:
     max_lora_chunk_size: Optional[int] = 16
     ## For MobiLoRA
     enable_delta_cache: Optional[bool] = False
+    compression_backend: Optional[str] = "cuszp"
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -3586,7 +3587,14 @@ class ServerArgs:
             "--enable-delta-cache",
             default=ServerArgs.enable_delta_cache,
             action="store_true",
-            help="enbale Mobilora Delta kv cache for different lora, need to enable lora",
+            help="enbale MobiLoRA Delta kv cache for different lora, need to enable lora",
+        )
+        
+        parser.add_argument(
+            "--compression-backend",
+            type=str,
+            default=ServerArgs.compression_backend,
+            help="select compression method backend for MobiLoRA",
         )
         
         # For Multi-Modal

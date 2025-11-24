@@ -1202,6 +1202,7 @@ def sample_random_requests(
     dataset_path: str,
     random_sample: bool = True,
     return_text: bool = True,
+    seed: Optional[int] = None,
 ) -> List[DatasetRow]:
     input_lens = np.random.randint(
         max(int(input_len * range_ratio), 1),
@@ -1239,7 +1240,10 @@ def sample_random_requests(
             for data in dataset
         ]
         # Shuffle the dataset.
-        random.shuffle(dataset)
+        if seed is not None:
+            rng = random.Random(seed)
+            rng.shuffle(dataset)
+            # random.shuffle(dataset)
 
         # Filter out sequences that are too long or too short
         input_requests: List[DatasetRow] = []

@@ -47,13 +47,6 @@ from sglang.srt.mem_cache.evict_policy import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
-from sglang.srt.lora_diff.pysz import SZ
-import sys
-lib_extension = {
-    "darwin": "libSZ3c.dylib",
-    "windows": "SZ3c.dll",
-}.get(sys.platform, "libSZ3c.so")
-sz = SZ("/home/wangyitao/tools/SZ3/install/lib/{}".format(lib_extension))
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -239,6 +232,7 @@ class RadixCache(BasePrefixCache):
         eviction_policy: str = "lru",
         is_eagle: bool = False,
         enable_delta_cache: Optional[bool] = False,
+        compression_backend: Optional[str] = None,  # sz or cuSZp
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
@@ -248,6 +242,7 @@ class RadixCache(BasePrefixCache):
         self.kv_event_queue = []
         self.is_eagle = is_eagle
         self.enable_delta_cache = enable_delta_cache
+        self.compression_backend = compression_backend
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -255,15 +250,27 @@ class RadixCache(BasePrefixCache):
             self.device = torch.device("cpu")
 
         if enable_delta_cache:
+            # 延迟引入
+            from sglang.srt.mem_cache.delta_cache import CuSZpBackend, SZBackend
+
             self.key_match_fn_token_only = _key_match_token_only
             self.key_match_fn_extra_key = _key_match_extra_key
             self.key_match_fn = _key_match_page_size1
             self.get_child_key_fn = get_child_key_token_only
 
-            self.delta_data_pool: Dict[int, np.ndarray] = {}
-            self.total_delta_bytes = 0
-            
+            # 通用存储池：可以存 Tensor(cuSZp)，也可以存 numpy （SZ）
+            self.delta_data_pool: Dict[int, Union[torch.Tensor, np.ndarray]] = {}
+
+            self.total_delta_bytes = 0  # 压缩后的物理字节数
+            self.total_delta_len = 0    # 逻辑上的 Token 总数量
             self.delta_data_counter: int = 0
+
+            if self.compression_backend == "cuszp":
+                self.compressor = CuSZpBackend(self.device)
+            elif self.compression_backend == "sz":
+                self.compressor = SZBackend()
+            else:
+                raise ValueError(f"Unknown compression backend: {compression_backend}")
         else:
             if self.page_size == 1:
                 self.key_match_fn = _key_match_page_size1
@@ -593,6 +600,10 @@ class RadixCache(BasePrefixCache):
 
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
+
+            # 级联的 delta_node 全部删掉
+            self._free_node_delta_resources(x)
+
             self._delete_leaf(x)
 
             if len(x.parent.children) == 0:
@@ -651,43 +662,84 @@ class RadixCache(BasePrefixCache):
         _dfs_helper(self.root_node)
         return torch.cat(values)
     
-    def store_in_delta_pool(self, compressed_data) -> int:
+    def store_in_delta_pool(self, compressed_data, delta_len=0) -> int:
         """
-        (新增) 将压缩数据存入 "新区域" (delta_data_pool)
-        并返回一个唯一的 handle (int)。
+        (修改) 存储 GPU Tensor 并使用 numel * element_size 统计字节。
         """
-        # 1. 获取当前的计数器值作为此数据的唯一 handle
         handle = self.delta_data_counter
-        # 2. 将压缩数据存储在 dict 中
         self.delta_data_pool[handle] = compressed_data
-        self.total_delta_bytes += compressed_data.shape[0]
-        # 3. 递增计数器，为下一次存储做准备
+
+        if isinstance(compressed_data, torch.Tensor):
+            # cuSZp case
+            size_bytes = compressed_data.numel() * compressed_data.element_size()
+        else:
+            # SZ Case (numpy)
+            size_bytes = compressed_data.nbytes
+        
+        self.total_delta_bytes += size_bytes
+
         self.delta_data_counter += 1
-        # 4. 返回这个 handle，以便 _store_value_in_node
-        #    可以将其存储在 delta_node.delta_data 中
         return handle
     
     def release_from_delta_pool(self, delta_data_tuple: tuple):
-        """(新增) 从 "新区域" 释放数据。"""
-        # (我们使用一个包含 7 个元素的元组)
-        if (delta_data_tuple is None or len(delta_data_tuple) != 7 
-            or delta_data_tuple[6] != "diff_list_v2"):
-            return 
+        """(修改) 释放 GPU Tensor 并更新计数。"""
+
+        if self.compression_backend == "sz":
+            if (delta_data_tuple is None or len(delta_data_tuple) != 7
+                or delta_data_tuple[6] != "diff_list_v2"):
+                return 
+            handle_K_list, handle_V_list, k_shape, _, _, _, _ = delta_data_tuple
+
+        elif self.compression_backend == "cuszp":
+            if (delta_data_tuple is None or len(delta_data_tuple) != 9
+                or delta_data_tuple[6] != "diff_list_v2"):
+                return 
+            handle_K_list, handle_V_list, k_shape, _, _, _, _, _, _ = delta_data_tuple
         
-        handle_K_list, handle_V_list, _, _, _, _, _ = delta_data_tuple
-        
+        # 释放逻辑长度
+        delta_token_len = k_shape[0]
+        self.total_delta_len -= delta_token_len
+
         for handle in handle_K_list + handle_V_list:
             if handle in self.delta_data_pool:
-                self.total_delta_bytes -= self.delta_data_pool[handle].shape[0]
-                del self.delta_data_pool[handle]
+                data = self.delta_data_pool[handle]
                 
-    def compress(self, target_tensor):
+                # [Dynamic] 释放时同样判断类型
+                if isinstance(data, torch.Tensor):
+                    size_bytes = data.numel() * data.element_size()
+                else:
+                    size_bytes = data.nbytes
+                self.total_delta_bytes -= size_bytes
+                del self.delta_data_pool[handle]
+
+    def _get_dynamic_error_bound(self, base_tensor: torch.Tensor, delta_tensor: torch.Tensor) -> float:
+        """
+        (新增) 根据 Base 和 Delta 的余弦相似度动态决定 Error Bound (eb_abs)。
+        逻辑：相似度越高 -> Diff 越小 -> 需要越高的精度 (越小的 eb_abs)。
+        """
+        # 为了计算速度，可以只采样一部分，或者直接 flatten 计算
+        # 这里为了准确性使用 flatten (注意性能开销，显存拷贝是主要瓶颈，这个计算相对较快)
+        sim = torch.nn.functional.cosine_similarity(
+            base_tensor.flatten().float(), 
+            delta_tensor.flatten().float(), 
+            dim=0
+        ).item()
+        
+        # 简单的分级策略 (阈值可根据实验调整)
+        if sim > 0.975:
+            return 1e-4
+        elif sim > 0.85:
+            return 1e-3 
+        else:
+            return 1e-2
+        
+    def compress(self, target_tensor, eb_abs):
         # TODO: 实现 compress 函数
         
         diff_tensor = target_tensor
         diff_numpy = diff_tensor.detach().cpu().float().numpy()  # 转为 NumPy 数组
 
-        diff_compressed, _ = sz.compress(diff_numpy, eb_mode=0, eb_abs=1e-3, eb_rel=0, eb_pwr=0)
+        diff_compressed, _ = sz.compress(diff_numpy, eb_mode=0, eb_abs=eb_abs, eb_rel=0, eb_pwr=0)
 
         diff_tensor_size = diff_tensor.numel() * diff_tensor.element_size()
         compressed_size = diff_compressed.nbytes
@@ -703,21 +755,32 @@ class RadixCache(BasePrefixCache):
     
     def recompute_diff(self, base_indices, delta_indices, extra_key, key_segment):
         """
-        (新增) 核心辅助函数。
-        计算 diff, 压缩, 存入 pool, 并返回一个
-        填充了 "数据" (handles) 和 "配方" (indices) 的新 Delta 节点。
+        (修改) 调用 compress_cuSZp。
         """
+        start_time = time.perf_counter()
+
         device = self.token_to_kv_pool_allocator.device
         base_indices = base_indices.to(device)
         delta_indices = delta_indices.to(device)
 
         handle_K_list = []
         handle_V_list = []
+
+        # 用于存储每一层的 error bound
+        k_eb_list = []
+        v_eb_list = []
+
         kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-        num_layers = len(kv_cache.k_buffer) # 假设为 32
+        num_layers = len(kv_cache.k_buffer) 
 
         k_shape, v_shape = None, None
         k_dtype, v_dtype = None, None
+
+        total_orig_bytes = 0
+        total_comp_bytes = 0
+        
+        delta_len = len(base_indices)
+        self.total_delta_len += delta_len
 
         for i in range(num_layers): 
             base_k_buffer_layer, base_v_buffer_layer = kv_cache.k_buffer[i], kv_cache.v_buffer[i]
@@ -727,6 +790,12 @@ class RadixCache(BasePrefixCache):
             delta_K_tensor = base_k_buffer_layer.index_select(0, delta_indices)
             delta_V_tensor = base_v_buffer_layer.index_select(0, delta_indices)
 
+            k_eb = self._get_dynamic_error_bound(base_K_tensor, delta_K_tensor)
+            v_eb = self._get_dynamic_error_bound(base_V_tensor, delta_V_tensor)
+
+            k_eb_list.append(k_eb)
+            v_eb_list.append(v_eb)
+            
             diff_K = delta_K_tensor - base_K_tensor
             diff_V = delta_V_tensor - base_V_tensor
 
@@ -734,26 +803,59 @@ class RadixCache(BasePrefixCache):
                 k_shape, k_dtype = diff_K.shape, diff_K.dtype
                 v_shape, v_dtype = diff_V.shape, diff_V.dtype
 
-            compressed_K_np = self.compress(diff_K)
-            compressed_V_np = self.compress(diff_V)
+            compressed_K = self.compressor.compress(diff_K, error_bound=k_eb)
+            compressed_V = self.compressor.compress(diff_V, error_bound=v_eb)
             
-            handle_K_list.append(self.store_in_delta_pool(compressed_K_np))
-            handle_V_list.append(self.store_in_delta_pool(compressed_V_np))
+            # 统计原始字节数 (BF16 = 2 bytes), 注意 SZ 返回 numpy, cuSZp 返回 Tensor
+            orig_size = (diff_K.numel() * diff_K.element_size()) + (diff_V.numel() * diff_V.element_size())
+            total_orig_bytes += orig_size
+            
+            # 统计压缩字节数
+            comp_size_k = compressed_K.numel() * compressed_K.element_size() if isinstance(compressed_K, torch.Tensor) else compressed_K.nbytes
+            comp_size_v = compressed_V.numel() * compressed_V.element_size() if isinstance(compressed_V, torch.Tensor) else compressed_V.nbytes
+            total_comp_bytes += (comp_size_k + comp_size_v)
+            
+            handle_K_list.append(self.store_in_delta_pool(compressed_K, delta_len))
+            handle_V_list.append(self.store_in_delta_pool(compressed_V, delta_len))
 
-        # 创建新节点
+        used_slots, log_toks, saved_mem = self.get_memory_stats()
+        print(f"[DeltaCache Stats] Total Bytes: {self.total_delta_bytes} | Saved: {saved_mem:.2f} MB")
+
         new_delta_node = TreeNode()
         new_delta_node.key = key_segment
-        
-        # 存储 "数据" (句柄 + 元数据)
+
         new_delta_node.delta_data = (
             handle_K_list, handle_V_list, 
             k_shape, v_shape, k_dtype, v_dtype, 
-            "diff_list_v2" # 新标签
+            "diff_list_v2",
+            k_eb_list, v_eb_list
         )
-        # 存储 "配方" (原始索引的副本)
         new_delta_node.value = delta_indices.cpu() 
         
+        duration = (time.perf_counter() - start_time) * 1000
+        ratio = total_orig_bytes / total_comp_bytes if total_comp_bytes > 0 else 0
+        print(f"[DeltaCache] 📉 Write(Diff-GPU): LoRA={extra_key} | Ratio={ratio:.2f}x | Time={duration:.2f}ms")
+        
         return new_delta_node
+    
+    def get_memory_stats(self):
+        """
+        计算并返回 Delta Cache 的内存节省统计信息。
+        """
+        # self.total_delta_bytes, sz返回一个 numpy 数组，uint8 格式，因此一个就是一字节
+
+        # 计算一个 delta_bytes占多少 token槽位：2bytes(bf16) * 32 (num_layers) * 8*128 (hidden_states) = total_bytes
+        kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
+        total_kv_slots = self.total_delta_bytes / (32 * 8 * 128 * 2)  # 1 个 slot 占用空间：32 * 8 * 128 * 2 字节
+
+        # 计算节省了多少空间
+        # 原本占用空间：
+        origin_occupy_space = self.total_delta_len * 2 * 32 * 1024 * 2  # prompt 长度 * 2(kv) * 32(num_layers) * 4096(hidden_states) * 2(bf16) bytes
+        # 现在占用空间：
+        cur_occupy_space = self.total_delta_bytes
+
+        saved_space = (origin_occupy_space - cur_occupy_space) / (1024 * 1024)  # MB
+        return total_kv_slots, self.total_delta_len, saved_space
 
     ##### Internal Helper Functions #####
 
@@ -766,7 +868,7 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
-            prefix_len = self.key_match_fn_only(child.key, key)
+            prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -1048,6 +1150,8 @@ class RadixCache(BasePrefixCache):
             node.is_base = True
             node.key.extra_key = extra_key 
             node.value = value_segment # Base 存储 *索引* (Tensor)
+            # [Log] 记录 Base 创建
+            print(f"[DeltaCache] 🟦 Set Base: LoRA={extra_key} | NodeID={node.id}")
         
         # Case 2: 插入的 extra_key 与 base 相同 (相同的不进行覆盖 base)
         elif node.key.extra_key == extra_key:
@@ -1059,6 +1163,9 @@ class RadixCache(BasePrefixCache):
         
         # Case 3: 插入的 extra_key 是一个新的 "delta"
         else:
+            # [Log] 触发 Delta 存储逻辑
+            print(f"[DeltaCache] 🔀 Detect Variant: Base={node.key.extra_key} vs New={extra_key}")
+
             base_indices = node.value    # Base 配方
             delta_indices = value_segment # Delta 配方
 
@@ -1070,6 +1177,8 @@ class RadixCache(BasePrefixCache):
             # --- 3b. 将新节点插入 delta_node 字典 ---
             existing_delta_node = node.delta_node.get(extra_key)
             if existing_delta_node:
+                # [Log] 如果覆盖了旧的 Delta
+                print(f"[DeltaCache] 🔄 Overwriting existing Delta for {extra_key}")
                 self.release_from_delta_pool(existing_delta_node.delta_data) # 释放旧 handle
             
             new_delta_node.base_node = node
@@ -1123,76 +1232,74 @@ class RadixCache(BasePrefixCache):
     
     def _reconstruct_and_alloc(self, segment_info: tuple) -> Optional[torch.Tensor]:
         """
-        (新增) 核心重建函数。
-        接收来自 _get_value_for_key 的 ("delta", ...) 元组,
-        执行 32 层解压、重建、分配新槽位并复制。
-        返回 *新分配的索引* (Tensor)。
+        (修改) 调用 decompress_cuSZp。
         """
         data, type, metadata = segment_info
 
-        # Case 1: 如果是 Base, 无需重建, 直接返回索引
         if type == "base":
-            return data # data 已经是索引 (Tensor)
+            return data 
         
-        # Case 2: 如果是 Miss, 返回 None
         if type == "miss":
             return None
             
-        # Case 3: 如果是 Delta, 执行重建
         if type == "delta":
-            delta_data_tuple = data
-            base_indices = metadata # Base 的 "配方"
-            
-            # --- 3a. 解析句柄和元数据 ---
-            (handle_K_list, handle_V_list, 
-             k_shape, v_shape, k_dtype, v_dtype, 
-             _) = delta_data_tuple
+            start_time = time.perf_counter()
 
-            # --- 3b. 分配新槽位 (在主 KV Pool 中) ---
-            # 我们需要为重建的数据分配空间。
-            # 数量由 k_shape[0] (即 token 数量) 决定。
+            delta_data_tuple = data
+            base_indices = metadata 
+            
+            if self.compression_backend == "sz":
+                # sz
+                (handle_K_list, handle_V_list, 
+                 k_shape, v_shape, k_dtype, v_dtype, 
+                 _, k_eb_list, v_eb_list) = delta_data_tuple
+            else:
+                # cuszp
+                (handle_K_list, handle_V_list, 
+                k_shape, v_shape, k_dtype, v_dtype, 
+                _, k_eb_list, v_eb_list) = delta_data_tuple
+
             num_tokens_to_alloc = k_shape[0]
             if num_tokens_to_alloc == 0:
                 return torch.tensor([], dtype=torch.int64, device=self.device)
                 
             new_indices = self.token_to_kv_pool_allocator.alloc(num_tokens_to_alloc)
             if new_indices is None:
-                print(f"WARNING: KV Pool OOM. Failed to allocate {num_tokens_to_alloc} slots for reconstruction.")
-                return None # 分配失败
+                print(f"[DeltaCache] ❌ OOM Warning")
+                return None
 
-            # --- 3c. 循环 32 层进行重建和复制 ---
             kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
-            num_layers = len(kv_cache.k_buffer) # 32
+            num_layers = len(kv_cache.k_buffer) 
             
-            base_indcies = base_indices.to(self.device)
+            base_indices = base_indices.to(self.device)
 
             for i in range(num_layers):
-                # i. 获取 Base KV 张量
                 base_K_tensor = kv_cache.k_buffer[i].index_select(0, base_indices)
                 base_V_tensor = kv_cache.v_buffer[i].index_select(0, base_indices)
                 
-                # ii. 获取并解压 Diff K
                 handle_K = handle_K_list[i]
-                compressed_K_np = self.delta_data_pool[handle_K]
-                diff_K = self.decompress(compressed_K_np, base_K_tensor.shape, np.float32)
+                compressed_K = self.delta_data_pool[handle_K]
+    
+                # 通用解压器
+                diff_K = self.compressor.decompress(compressed_K, base_K_tensor.shape, k_dtype, k_eb_list[i])
                 
-                # iii. 获取并解压 Diff V
                 handle_V = handle_V_list[i]
-                compressed_V_np = self.delta_data_pool[handle_V]
-                diff_V = self.decompress(compressed_V_np, base_V_tensor.shape, np.float32)
+                compressed_V = self.delta_data_pool[handle_V]
                 
-                # iv. 重建
+                diff_V = self.compressor.decompress(compressed_V, base_V_tensor.shape, v_dtype, v_eb_list[i])
+                
                 reconstructed_K = base_K_tensor + diff_K
                 reconstructed_V = base_V_tensor + diff_V
                 
-                # v. 复制 (Scatter) 到新分配的槽位
                 kv_cache.k_buffer[i].index_copy_(0, new_indices, reconstructed_K)
                 kv_cache.v_buffer[i].index_copy_(0, new_indices, reconstructed_V)
 
-            # --- 3d. 返回新分配的索引 ---
+            duration = (time.perf_counter() - start_time) * 1000
+            print(f"[DeltaCache] 📈 Read(Reconstruct-GPU): Tokens={num_tokens_to_alloc} | Time={duration:.2f}ms")
+
             return new_indices
             
-        return None # 不应到达这里
+        return None 
 
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""
@@ -1218,6 +1325,25 @@ class RadixCache(BasePrefixCache):
                 break
         del node.parent.children[k]
         self.evictable_size_ -= len(node.key)
+    
+    def _free_node_delta_resources(self, node: TreeNode):
+        """
+        (新增) 辅助函数：释放一个节点下挂载的所有 Delta 资源。
+        这是为了防止 Memory Leak。当一个 Base 节点被 Evict 时，
+        依附于它的所有 Delta 节点也必须被销毁，因为没有 Base 它们无法还原。
+        """
+        if not self.enable_delta_cache:
+            return
+
+        # 遍历该节点挂载的所有 Delta 变体
+        for extra_key, delta_node in node.delta_node.items():
+            if delta_node.delta_data is not None:
+                # [Critical] 必须从全局池中释放内存，否则会泄露
+                self.release_from_delta_pool(delta_node.delta_data)
+                
+        
+        # 清空字典，断开引用
+        node.delta_node.clear()
 
     def _total_size_helper(self):
         total_size = 0
