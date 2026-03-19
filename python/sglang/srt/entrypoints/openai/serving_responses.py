@@ -280,6 +280,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                         stream=request.stream,
                         rid=request.request_id,
                         extra_key=self._compute_extra_key(request),
+                        app_id=request.app_id,
+                        app_state=request.app_state,
                         background=request.background,
                     )
 
@@ -1295,6 +1297,8 @@ class OpenAIServingResponses(OpenAIServingChat):
                 stream=adapted_request.stream,
                 rid=request_id,
                 extra_key=adapted_request.extra_key,
+                app_id=request.app_id,
+                app_state=request.app_state,
                 return_logprob=adapted_request.return_logprob,
                 logprob_start_len=adapted_request.logprob_start_len,
                 top_logprobs_num=adapted_request.top_logprobs_num,

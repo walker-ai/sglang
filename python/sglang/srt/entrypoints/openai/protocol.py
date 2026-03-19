@@ -261,6 +261,10 @@ class CompletionRequest(BaseModel):
     rid: Optional[Union[List[str], str]] = None
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
+    # App id for context-aware eviction
+    app_id: Optional[Union[List[str], str]] = None
+    # App state for context-aware eviction (foreground/background/killed)
+    app_state: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
@@ -520,6 +524,10 @@ class ChatCompletionRequest(BaseModel):
     rid: Optional[Union[List[str], str]] = None
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
+    # App id for context-aware eviction
+    app_id: Optional[Union[List[str], str]] = None
+    # App state for context-aware eviction (foreground/background/killed)
+    app_state: Optional[Union[List[str], str]] = None
     # Cache salt for request caching
     cache_salt: Optional[Union[List[str], str]] = None
     # Priority for the request
@@ -985,6 +993,14 @@ class ResponsesRequest(BaseModel):
     extra_key: Optional[str] = Field(
         default=None,
         description="Extra key for classifying the request (e.g. cache_salt)",
+    )
+    app_id: Optional[str] = Field(
+        default=None,
+        description="App id for context-aware eviction",
+    )
+    app_state: Optional[str] = Field(
+        default=None,
+        description="App state for context-aware eviction (foreground/background/killed)",
     )
     cache_salt: Optional[str] = Field(
         default=None, description="Cache salt for request caching"

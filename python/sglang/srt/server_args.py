@@ -150,7 +150,15 @@ NSA_CHOICES = [
     "aiter",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu"]
+RADIX_EVICTION_POLICY_CHOICES = [
+    "lru",
+    "lfu",
+    "fifo",
+    "mru",
+    "filo",
+    "mobilora",
+    "hicache",
+]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -279,6 +287,20 @@ class ServerArgs:
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
+    mobilora_lambda_s: float = 1.0
+    mobilora_lambda_t: float = 1.0
+    mobilora_lambda_l: float = 1.0
+    mobilora_phi_s: str = "log1p"
+    mobilora_phi_t: str = "log1p"
+    mobilora_phi_l: str = "log1p"
+    mobilora_tau: float = 1.0
+    mobilora_len_norm: float = 1.0
+    mobilora_app_ttl: float = 30.0
+    mobilora_app_agg: str = "sum"
+    app_state_mode: str = "touch"
+    app_state_interval: float = 1.0
+    app_state_seed: Optional[int] = None
+    app_state_weights: str = "0.6,0.3,0.1"
 
     # Runtime options
     device: Optional[str] = None
@@ -2184,7 +2206,100 @@ class ServerArgs:
             type=str,
             choices=RADIX_EVICTION_POLICY_CHOICES,
             default=ServerArgs.radix_eviction_policy,
-            help="The eviction policy of radix trees. 'lru' stands for Least Recently Used, 'lfu' stands for Least Frequently Used.",
+            help=(
+                "The eviction policy of radix trees. 'lru' stands for Least Recently "
+                "Used, 'lfu' stands for Least Frequently Used, 'mobilora' enables "
+                "context-aware scoring, and 'hicache' is a HiCache-aware variant."
+            ),
+        )
+        parser.add_argument(
+            "--mobilora-lambda-s",
+            type=float,
+            default=ServerArgs.mobilora_lambda_s,
+            help="MobiLoRA utility weight for app state score.",
+        )
+        parser.add_argument(
+            "--mobilora-lambda-t",
+            type=float,
+            default=ServerArgs.mobilora_lambda_t,
+            help="MobiLoRA utility weight for LRU score.",
+        )
+        parser.add_argument(
+            "--mobilora-lambda-l",
+            type=float,
+            default=ServerArgs.mobilora_lambda_l,
+            help="MobiLoRA utility weight for length score.",
+        )
+        parser.add_argument(
+            "--mobilora-phi-s",
+            type=str,
+            choices=["log1p", "sqrt", "identity"],
+            default=ServerArgs.mobilora_phi_s,
+            help="MobiLoRA phi function for app state score.",
+        )
+        parser.add_argument(
+            "--mobilora-phi-t",
+            type=str,
+            choices=["log1p", "sqrt", "identity"],
+            default=ServerArgs.mobilora_phi_t,
+            help="MobiLoRA phi function for LRU score.",
+        )
+        parser.add_argument(
+            "--mobilora-phi-l",
+            type=str,
+            choices=["log1p", "sqrt", "identity"],
+            default=ServerArgs.mobilora_phi_l,
+            help="MobiLoRA phi function for length score.",
+        )
+        parser.add_argument(
+            "--mobilora-tau",
+            type=float,
+            default=ServerArgs.mobilora_tau,
+            help="MobiLoRA time decay tau for LRU score.",
+        )
+        parser.add_argument(
+            "--mobilora-len-norm",
+            type=float,
+            default=ServerArgs.mobilora_len_norm,
+            help="MobiLoRA length normalization factor.",
+        )
+        parser.add_argument(
+            "--mobilora-app-ttl",
+            type=float,
+            default=ServerArgs.mobilora_app_ttl,
+            help="MobiLoRA app association TTL in seconds (<=0 means no filter).",
+        )
+        parser.add_argument(
+            "--mobilora-app-agg",
+            type=str,
+            choices=["sum", "max"],
+            default=ServerArgs.mobilora_app_agg,
+            help="MobiLoRA aggregation for app scores across associated apps.",
+        )
+        parser.add_argument(
+            "--app-state-mode",
+            type=str,
+            choices=["touch", "random", "timeline"],
+            default=ServerArgs.app_state_mode,
+            help="App state simulation mode.",
+        )
+        parser.add_argument(
+            "--app-state-interval",
+            type=float,
+            default=ServerArgs.app_state_interval,
+            help="App state update interval or timeline bucket size in seconds.",
+        )
+        parser.add_argument(
+            "--app-state-seed",
+            type=int,
+            default=ServerArgs.app_state_seed,
+            help="Random seed for app state simulation.",
+        )
+        parser.add_argument(
+            "--app-state-weights",
+            type=str,
+            default=ServerArgs.app_state_weights,
+            help="App state weights as 'foreground,background,killed'.",
         )
 
         # Runtime options

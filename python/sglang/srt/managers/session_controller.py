@@ -145,6 +145,7 @@ class Session:
             top_logprobs_num=req.top_logprobs_num,
             token_ids_logprob=req.token_ids_logprob,
             vocab_size=tokenizer.vocab_size,
+            app_id=req.app_id,
         )
         if last_req is not None:
             new_req.multimodal_inputs = last_req.multimodal_inputs

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Dict, Optional, Union
 
 import torch
 
@@ -79,6 +79,7 @@ class LMCRadixCache(RadixCache):
         rank: int = 0,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         eviction_policy: str = "lru",
+        mobilora_params: Optional[Dict[str, Union[float, str]]] = None,
     ):
         super().__init__(
             req_to_token_pool=req_to_token_pool,
@@ -87,6 +88,7 @@ class LMCRadixCache(RadixCache):
             disable=disable,
             enable_kv_cache_events=enable_kv_cache_events,
             eviction_policy=eviction_policy,
+            mobilora_params=mobilora_params,
         )
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
@@ -229,7 +231,9 @@ class LMCRadixCache(RadixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        _, new_last_node, _, _ = self.match_prefix(RadixKey(token_ids, req.extra_key))
+        _, new_last_node, _, _ = self.match_prefix(
+            RadixKey(token_ids, req.extra_key, req.app_id)
+        )
         assert new_last_node is not None
 
         self.inc_lock_ref(new_last_node)

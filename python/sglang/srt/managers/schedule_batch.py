@@ -460,6 +460,7 @@ class Req:
         priority: Optional[int] = None,
         metrics_collector: Optional[SchedulerMetricsCollector] = None,
         extra_key: Optional[str] = None,
+        app_id: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
     ):
@@ -506,6 +507,7 @@ class Req:
 
         self.extra_key = extra_key
         self.lora_id = lora_id
+        self.app_id = app_id
 
         # Memory pool info
         self.req_pool_idx: Optional[int] = None
@@ -730,7 +732,11 @@ class Req:
                 self.last_host_node,
                 self.host_hit_length,
             ) = tree_cache.match_prefix(
-                key=RadixKey(token_ids=token_ids, extra_key=self.extra_key),
+                key=RadixKey(
+                    token_ids=token_ids,
+                    extra_key=self.extra_key,
+                    app_id=self.app_id,
+                ),
                 **(
                     {"req": self, "cow_mamba": True}
                     if isinstance(tree_cache, MambaRadixCache)

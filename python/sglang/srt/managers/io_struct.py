@@ -214,6 +214,12 @@ class GenerateReqInput(BaseReq):
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[Union[List[str], str]] = None
+    # App id for context-aware eviction
+    app_id: Optional[Union[List[str], str]] = None
+    # App state for context-aware eviction (foreground/background/killed)
+    app_state: Optional[Union[List[str], str]] = None
+    # App states for global updates (app_id -> state string)
+    app_states: Optional[Dict[str, str]] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False
@@ -623,6 +629,9 @@ class GenerateReqInput(BaseReq):
             conversation_id=self.conversation_id,
             priority=self.priority,
             extra_key=self.extra_key,
+            app_id=self.app_id,
+            app_state=self.app_state,
+            app_states=self.app_states,
             no_logs=self.no_logs,
             custom_labels=self.custom_labels,
             return_bytes=self.return_bytes,
@@ -683,6 +692,12 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Extra key for classifying the request (e.g. cache_salt)
     extra_key: Optional[str] = None
+    # App id for context-aware eviction
+    app_id: Optional[str] = None
+    # App state for context-aware eviction (foreground/background/killed)
+    app_state: Optional[str] = None
+    # App states for global updates (app_id -> state string)
+    app_states: Optional[Dict[str, str]] = None
 
     # Whether to disallow logging for this request (e.g. due to ZDR)
     no_logs: bool = False

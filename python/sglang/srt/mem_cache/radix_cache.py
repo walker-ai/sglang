@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Set
 
 """
 Copyright 2023-2024 SGLang Team
@@ -22,6 +22,7 @@ The radix tree data structure for managing the KV cache.
 """
 
 import heapq
+import os
 import time
 from collections import defaultdict
 from functools import lru_cache, partial
@@ -36,13 +37,16 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStored,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.app_state_monitor import global_app_monitor
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, MatchResult
 from sglang.srt.mem_cache.evict_policy import (
     EvictionStrategy,
     FIFOStrategy,
     FILOStrategy,
+    HiCacheAwareEvictionStrategy,
     LFUStrategy,
     LRUStrategy,
+    MobiLoRAEvictionStrategy,
     MRUStrategy,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -54,11 +58,18 @@ if TYPE_CHECKING:
 
 class RadixKey:
 
-    def __init__(self, token_ids: List[int], extra_key: Optional[str] = None):
+    def __init__(
+        self,
+        token_ids: List[int],
+        extra_key: Optional[str] = None,
+        app_id: Optional[str] = None,
+    ):
         # token ids sequence
         self.token_ids = token_ids
         # extra key (e.g. lora_id, cache_salt)
         self.extra_key = extra_key
+        # app id for context-aware eviction (not part of key matching)
+        self.app_id = app_id
 
     def __len__(self) -> int:
         return len(self.token_ids)
@@ -68,12 +79,17 @@ class RadixKey:
 
     def __getitem__(self, idx: Union[int, slice]) -> "RadixKey":
         if isinstance(idx, slice):
-            return RadixKey(self.token_ids[idx], self.extra_key)
-        return RadixKey([self.token_ids[idx]], self.extra_key)
+            return RadixKey(self.token_ids[idx], self.extra_key, self.app_id)
+        return RadixKey([self.token_ids[idx]], self.extra_key, self.app_id)
 
     def __repr__(self) -> str:
         preview = self.token_ids[:10]
-        return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''})"
+        return (
+            "RadixKey("
+            f"extra_key={self.extra_key!r}, "
+            f"app_id={self.app_id!r}, "
+            f"token_ids={preview}{'...' if len(self.token_ids) > 10 else ''})"
+        )
 
 
 class TreeNode:
@@ -97,6 +113,10 @@ class TreeNode:
         self.host_value: Optional[torch.Tensor] = None
         # store hash values of each pages
         self.hash_value: Optional[List[str]] = None
+        # apps associated with this node (for context-aware eviction)
+        self.associated_apps: Set[str] = set()
+        # last seen time per app on this node (for context-aware eviction)
+        self.associated_app_last_seen: Dict[str, float] = {}
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
@@ -230,6 +250,7 @@ class RadixCache(BasePrefixCache):
         disable: bool = False,
         enable_kv_cache_events: bool = False,
         eviction_policy: str = "lru",
+        mobilora_params: Optional[Dict[str, Union[float, str]]] = None,
         is_eagle: bool = False,
         enable_delta_cache: Optional[bool] = False,
         compression_backend: Optional[str] = None,  # sz or cuSZp
@@ -243,11 +264,15 @@ class RadixCache(BasePrefixCache):
         self.is_eagle = is_eagle
         self.enable_delta_cache = enable_delta_cache
         self.compression_backend = compression_backend
+        self.direct_delta_indices = False
+        self.delta_log_enabled = os.getenv("SGLANG_DELTA_LOG", "0") == "1"
+        enable_delta_cache = self.enable_delta_cache
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
         else:
             self.device = torch.device("cpu")
+        self.global_app_monitor = global_app_monitor
 
         if enable_delta_cache:
             # 延迟引入
@@ -267,6 +292,9 @@ class RadixCache(BasePrefixCache):
 
             if self.compression_backend == "cuszp":
                 self.compressor = CuSZpBackend(self.device)
+                self.direct_delta_indices = (
+                    os.getenv("SGLANG_CUSZP_DIRECT_DELTA", "1") == "1"
+                )
             elif self.compression_backend == "sz":
                 self.compressor = SZBackend()
             else:
@@ -294,9 +322,19 @@ class RadixCache(BasePrefixCache):
             self.eviction_strategy: EvictionStrategy = MRUStrategy()
         elif eviction_policy.lower() == "filo":
             self.eviction_strategy: EvictionStrategy = FILOStrategy()
+        elif eviction_policy.lower() == "mobilora":
+            self.eviction_strategy = MobiLoRAEvictionStrategy(
+                **(mobilora_params or {})
+            )
+        elif eviction_policy.lower() == "hicache":
+            self.eviction_strategy = HiCacheAwareEvictionStrategy(
+                **(mobilora_params or {})
+            )
         else:
             raise ValueError(
-                f"Unknown eviction policy: {eviction_policy}. Supported policies: 'lru', 'lfu', 'fifo', 'mru', 'filo'."
+                "Unknown eviction policy: "
+                f"{eviction_policy}. Supported policies: "
+                "'lru', 'lfu', 'fifo', 'mru', 'filo', 'mobilora', 'hicache'."
             )
         self.reset()
 
@@ -408,7 +446,18 @@ class RadixCache(BasePrefixCache):
         
         # 3. 组装最终结果
         if final_indices_list:
-            value = torch.cat(final_indices_list)
+            total_len = sum(t.numel() for t in final_indices_list)
+            if total_len == 0:
+                value = torch.empty((0,), dtype=torch.int64, device=self.device)
+            else:
+                value = torch.empty((total_len,), dtype=torch.int64, device=self.device)
+                offset = 0
+                for t in final_indices_list:
+                    if t.device != self.device or t.dtype != torch.int64:
+                        t = t.to(device=self.device, dtype=torch.int64)
+                    end = offset + t.numel()
+                    value[offset:end] = t
+                    offset = end
         else:
             value = torch.empty((0,), dtype=torch.int64, device=self.device)
 
@@ -420,7 +469,13 @@ class RadixCache(BasePrefixCache):
             last_host_node=last_node,
         )
 
-    def insert(self, key: RadixKey, value=None, chunked=False):
+    def insert(
+        self,
+        key: RadixKey,
+        value=None,
+        chunked=False,
+        allow_delta_write: bool = True,
+    ):
         if self.disable:
             return 0
 
@@ -433,7 +488,9 @@ class RadixCache(BasePrefixCache):
             # Make sure the value len equal to the EAGLE bigram key len
             value = value[: len(key)]
 
-        return self._insert_helper(self.root_node, key, value)
+        return self._insert_helper(
+            self.root_node, key, value, allow_delta_write=allow_delta_write
+        )
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
@@ -476,8 +533,13 @@ class RadixCache(BasePrefixCache):
         # Radix Cache takes one ref in memory pool
         if is_insert:
             new_prefix_len = self.insert(
-                RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
+                RadixKey(
+                    token_ids[:page_aligned_token_len],
+                    req.extra_key,
+                    req.app_id,
+                ),
                 page_aligned_kv_indices,
+                allow_delta_write=True,
             )
             # Free the duplicates that were already in the tree
             self.token_to_kv_pool_allocator.free(
@@ -532,15 +594,20 @@ class RadixCache(BasePrefixCache):
 
         # Radix Cache takes one ref in memory pool
         new_prefix_len = self.insert(
-            RadixKey(page_aligned_token_ids, req.extra_key),
+            RadixKey(page_aligned_token_ids, req.extra_key, req.app_id),
             page_aligned_kv_indices,
             chunked=chunked,
+            allow_delta_write=False,
         )
         self.token_to_kv_pool_allocator.free(kv_indices[old_prefix_len:new_prefix_len])
 
         # The prefix indices could be updated, reuse it
         new_indices, new_last_node, _, _ = self.match_prefix(
-            RadixKey(token_ids=page_aligned_token_ids, extra_key=req.extra_key)
+            RadixKey(
+                token_ids=page_aligned_token_ids,
+                extra_key=req.extra_key,
+                app_id=req.app_id,
+            )
         )
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(old_prefix_len, len(new_indices))),
@@ -588,6 +655,19 @@ class RadixCache(BasePrefixCache):
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
+        debug = os.getenv("SGLANG_EVICT_DEBUG", "0") == "1"
+        debug_samples = int(os.getenv("SGLANG_EVICT_DEBUG_SAMPLES", "3"))
+        debug_strategy = getattr(self.eviction_strategy, "debug_components", None)
+        debug_logged = 0
+        if debug:
+            print(
+                "[evict_debug] "
+                f"policy={self.eviction_strategy.__class__.__name__} "
+                f"leaves={len(leaves)} "
+                f"target={num_tokens} "
+                f"evictable={self.evictable_size_} "
+                f"protected={self.protected_size_}"
+            )
 
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
@@ -597,6 +677,28 @@ class RadixCache(BasePrefixCache):
                 break
             if x.lock_ref > 0:
                 continue
+
+            if debug and debug_strategy and debug_logged < debug_samples:
+                (
+                    state_score,
+                    lru_score,
+                    length_score,
+                    phi_s_val,
+                    phi_t_val,
+                    phi_l_val,
+                    utility,
+                ) = debug_strategy(x)
+                app_count = len(getattr(x, "associated_apps", ()))
+                value_len = len(x.value) if x.value is not None else 0
+                age = max(time.monotonic() - x.last_access_time, 0.0)
+                print(
+                    "[evict_debug] "
+                    f"node={x.id} apps={app_count} value_len={value_len} age={age:.3f} "
+                    f"state_sum={state_score:.3f} lru={lru_score:.3f} len={length_score:.1f} "
+                    f"phi_s={phi_s_val:.3f} phi_t={phi_t_val:.3f} phi_l={phi_l_val:.3f} "
+                    f"priority={_priority:.3f} utility={utility:.3f}"
+                )
+                debug_logged += 1
 
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
@@ -611,6 +713,14 @@ class RadixCache(BasePrefixCache):
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
             self._record_remove_event(x)
+
+        if debug:
+            print(
+                "[evict_debug] "
+                f"evicted_tokens={num_evicted} "
+                f"remaining_evictable={self.evictable_size_} "
+                f"protected={self.protected_size_}"
+            )
 
     def inc_lock_ref(self, node: TreeNode):
         if self.disable:
@@ -668,13 +778,21 @@ class RadixCache(BasePrefixCache):
         """
         handle = self.delta_data_counter
         self.delta_data_pool[handle] = compressed_data
+        data_obj = compressed_data
+        length_hint = None
+        if isinstance(compressed_data, (tuple, list)) and len(compressed_data) == 2:
+            data_obj, length_hint = compressed_data
 
-        if isinstance(compressed_data, torch.Tensor):
+        if isinstance(data_obj, torch.Tensor):
             # cuSZp case
-            size_bytes = compressed_data.numel() * compressed_data.element_size()
+            size_bytes = (
+                data_obj.numel() * data_obj.element_size()
+                if length_hint is None
+                else length_hint
+            )
         else:
             # SZ Case (numpy)
-            size_bytes = compressed_data.nbytes
+            size_bytes = data_obj.nbytes if length_hint is None else length_hint
         
         self.total_delta_bytes += size_bytes
 
@@ -703,12 +821,20 @@ class RadixCache(BasePrefixCache):
         for handle in handle_K_list + handle_V_list:
             if handle in self.delta_data_pool:
                 data = self.delta_data_pool[handle]
+                data_obj = data
+                length_hint = None
+                if isinstance(data, (tuple, list)) and len(data) == 2:
+                    data_obj, length_hint = data
                 
                 # [Dynamic] 释放时同样判断类型
-                if isinstance(data, torch.Tensor):
-                    size_bytes = data.numel() * data.element_size()
+                if isinstance(data_obj, torch.Tensor):
+                    size_bytes = (
+                        data_obj.numel() * data_obj.element_size()
+                        if length_hint is None
+                        else length_hint
+                    )
                 else:
-                    size_bytes = data.nbytes
+                    size_bytes = data_obj.nbytes if length_hint is None else length_hint
                 self.total_delta_bytes -= size_bytes
                 del self.delta_data_pool[handle]
 
@@ -803,23 +929,34 @@ class RadixCache(BasePrefixCache):
                 k_shape, k_dtype = diff_K.shape, diff_K.dtype
                 v_shape, v_dtype = diff_V.shape, diff_V.dtype
 
-            compressed_K = self.compressor.compress(diff_K, error_bound=k_eb)
-            compressed_V = self.compressor.compress(diff_V, error_bound=v_eb)
+            compressed_K, comp_len_k = self.compressor.compress(diff_K, error_bound=k_eb)
+            compressed_V, comp_len_v = self.compressor.compress(diff_V, error_bound=v_eb)
             
             # 统计原始字节数 (BF16 = 2 bytes), 注意 SZ 返回 numpy, cuSZp 返回 Tensor
             orig_size = (diff_K.numel() * diff_K.element_size()) + (diff_V.numel() * diff_V.element_size())
             total_orig_bytes += orig_size
             
             # 统计压缩字节数
-            comp_size_k = compressed_K.numel() * compressed_K.element_size() if isinstance(compressed_K, torch.Tensor) else compressed_K.nbytes
-            comp_size_v = compressed_V.numel() * compressed_V.element_size() if isinstance(compressed_V, torch.Tensor) else compressed_V.nbytes
+            comp_size_k = (
+                compressed_K.numel() * compressed_K.element_size()
+                if comp_len_k is None
+                else comp_len_k
+            )
+            comp_size_v = (
+                compressed_V.numel() * compressed_V.element_size()
+                if comp_len_v is None
+                else comp_len_v
+            )
             total_comp_bytes += (comp_size_k + comp_size_v)
             
-            handle_K_list.append(self.store_in_delta_pool(compressed_K, delta_len))
-            handle_V_list.append(self.store_in_delta_pool(compressed_V, delta_len))
+            handle_K_list.append(self.store_in_delta_pool((compressed_K, comp_len_k), delta_len))
+            handle_V_list.append(self.store_in_delta_pool((compressed_V, comp_len_v), delta_len))
 
         used_slots, log_toks, saved_mem = self.get_memory_stats()
-        print(f"[DeltaCache Stats] Total Bytes: {self.total_delta_bytes} | Saved: {saved_mem:.2f} MB")
+        if self.delta_log_enabled:
+            print(
+                f"[DeltaCache Stats] Total Bytes: {self.total_delta_bytes} | Saved: {saved_mem:.2f} MB"
+            )
 
         new_delta_node = TreeNode()
         new_delta_node.key = key_segment
@@ -834,7 +971,10 @@ class RadixCache(BasePrefixCache):
         
         duration = (time.perf_counter() - start_time) * 1000
         ratio = total_orig_bytes / total_comp_bytes if total_comp_bytes > 0 else 0
-        print(f"[DeltaCache] 📉 Write(Diff-GPU): LoRA={extra_key} | Ratio={ratio:.2f}x | Time={duration:.2f}ms")
+        if self.delta_log_enabled:
+            print(
+                f"[DeltaCache] 📉 Write(Diff-GPU): LoRA={extra_key} | Ratio={ratio:.2f}x | Time={duration:.2f}ms"
+            )
         
         return new_delta_node
     
@@ -859,8 +999,17 @@ class RadixCache(BasePrefixCache):
 
     ##### Internal Helper Functions #####
 
+    def _associate_app(self, node: TreeNode, app_id: Optional[str]) -> None:
+        if not app_id:
+            return
+        now = time.monotonic()
+        node.associated_apps.add(app_id)
+        node.associated_app_last_seen[app_id] = now
+        self.global_app_monitor.touch(app_id, now=now)
+
     def _match_prefix_helper_legacy(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
+        self._associate_app(node, key.app_id)
 
         child_key = self.get_child_key_fn(key)
 
@@ -868,9 +1017,11 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
+            self._associate_app(child, key.app_id)
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
+                self._associate_app(new_node, key.app_id)
                 value.append(new_node.value)
                 node = new_node
                 break
@@ -896,6 +1047,7 @@ class RadixCache(BasePrefixCache):
 
         # --- 新的差分逻辑 ---
         node.last_access_time = time.monotonic()
+        self._associate_app(node, key.app_id)
         request_extra_key = key.extra_key
         search_key = key
         child_key = self.get_child_key_fn(search_key) # token-only
@@ -907,6 +1059,7 @@ class RadixCache(BasePrefixCache):
         while len(search_key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
+            self._associate_app(child, key.app_id)
             last_node = child # 总是更新 last_node 到 token 路径的末端
 
             prefix_len = self.key_match_fn_token_only(child.key, search_key)
@@ -914,6 +1067,7 @@ class RadixCache(BasePrefixCache):
             if prefix_len < len(child.key):
                 # --- 分裂情况 ---
                 new_split_node = self._split_node(child.key, child, prefix_len)
+                self._associate_app(new_split_node, key.app_id)
                 last_node = new_split_node # Token 路径在此结束
 
                 if extra_key_matched:
@@ -952,6 +1106,8 @@ class RadixCache(BasePrefixCache):
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len] 
+        new_node.associated_apps = set(child.associated_apps)
+        new_node.associated_app_last_seen = dict(child.associated_app_last_seen)
         child_key_suffix = child.key[split_len:]
         
         # --- 2. 差分缓存分裂逻辑 ---
@@ -969,6 +1125,30 @@ class RadixCache(BasePrefixCache):
             suffix_delta_nodes = {} 
             
             for extra_key, delta_node in child.delta_node.items():
+                if self.direct_delta_indices:
+                    original_delta_indices = delta_node.value
+                    if original_delta_indices is None:
+                        suffix_delta_nodes[extra_key] = delta_node
+                        continue
+                    prefix_delta_indices = original_delta_indices[:split_len]
+                    suffix_delta_indices = original_delta_indices[split_len:]
+
+                    if len(prefix_delta_indices) > 0 and new_node.value is not None:
+                        new_prefix_delta = TreeNode()
+                        new_prefix_delta.key = delta_node.key[:split_len]
+                        new_prefix_delta.value = prefix_delta_indices
+                        new_prefix_delta.delta_data = None
+                        new_prefix_delta.base_node = new_node
+                        new_node.delta_node[extra_key] = new_prefix_delta
+
+                    if len(suffix_delta_indices) > 0 and child.value is not None:
+                        new_suffix_delta = TreeNode()
+                        new_suffix_delta.key = delta_node.key[split_len:]
+                        new_suffix_delta.value = suffix_delta_indices
+                        new_suffix_delta.delta_data = None
+                        new_suffix_delta.base_node = child
+                        suffix_delta_nodes[extra_key] = new_suffix_delta
+                    continue
                 
                 # i. 释放旧的、无效的 Diff 数据 (句柄)
                 self.release_from_delta_pool(delta_node.delta_data)
@@ -1019,6 +1199,8 @@ class RadixCache(BasePrefixCache):
     def _insert_helper_legacy(self, node: TreeNode, key: RadixKey, value):
         """ 这是原版的 _insert_helper，用于非差分模式 """
         node.last_access_time = time.monotonic()
+        app_id = key.app_id
+        self._associate_app(node, app_id)
         if len(key) == 0:
             return 0
 
@@ -1028,6 +1210,7 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
+            self._associate_app(node, app_id)
             prefix_len = self.key_match_fn(node.key, key)
             total_prefix_length += prefix_len
             key = key[prefix_len:]
@@ -1035,6 +1218,7 @@ class RadixCache(BasePrefixCache):
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
+                self._associate_app(new_node, app_id)
                 node = new_node
 
             if len(key):
@@ -1045,12 +1229,15 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node
             new_node.key = key
             new_node.value = value
+            self._associate_app(new_node, app_id)
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._record_store_event(new_node)
         return total_prefix_length
 
-    def _insert_helper(self, node: TreeNode, key: RadixKey, value):
+    def _insert_helper(
+        self, node: TreeNode, key: RadixKey, value, allow_delta_write: bool = True
+    ):
         # 如果禁用了差分缓存，则使用旧的（非差分）逻辑
         if not self.enable_delta_cache:
             return self._insert_helper_legacy(node, key, value)
@@ -1058,6 +1245,8 @@ class RadixCache(BasePrefixCache):
         # --- 差分缓存开启时的逻辑 ---
         
         node.last_access_time = time.monotonic()
+        app_id = key.app_id
+        self._associate_app(node, app_id)
         if len(key) == 0:
             return 0
 
@@ -1069,6 +1258,7 @@ class RadixCache(BasePrefixCache):
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
+            self._associate_app(node, app_id)
             
             prefix_len = self.key_match_fn_token_only(node.key, key)
             radix_prefix_len = self.key_match_fn_extra_key(node.key, key)
@@ -1079,9 +1269,15 @@ class RadixCache(BasePrefixCache):
             if prefix_len < len(node.key):
                 # --- Case A: 节点分裂 ---
                 new_node = self._split_node(node.key, node, prefix_len)
+                self._associate_app(new_node, app_id)
                 
                 # 在分裂出的新父节点上存储
-                self._store_value_in_node(new_node, original_key, original_value) 
+                self._store_value_in_node(
+                    new_node,
+                    original_key,
+                    original_value,
+                    allow_delta_write=allow_delta_write,
+                )
                 node = new_node
                 # return total_prefix_length + prefix_len
 
@@ -1090,7 +1286,12 @@ class RadixCache(BasePrefixCache):
             # ******** 关键修复 ********
             # 我们刚刚完美匹配了 'node'。我们 *必须* 在此节点上存储
             # 我们的 (extra_key, value) 版本。
-            self._store_value_in_node(node, original_key, original_value)
+            self._store_value_in_node(
+                node,
+                original_key,
+                original_value,
+                allow_delta_write=allow_delta_write,
+            )
             # **************************
 
             # total_prefix_length += prefix_len
@@ -1107,16 +1308,28 @@ class RadixCache(BasePrefixCache):
             new_node.parent = node 
             new_node.key = key # 剩余的 key [4, 5]
             new_node.value = value
+            self._associate_app(new_node, app_id)
             
             # 存储
-            self._store_value_in_node(new_node, original_key, original_value)
+            self._store_value_in_node(
+                new_node,
+                original_key,
+                original_value,
+                allow_delta_write=allow_delta_write,
+            )
             
             node.children[child_key] = new_node
             self.evictable_size_ += len(key)
             self._record_store_event(new_node)
         return total_prefix_length
     
-    def _store_value_in_node(self, node: TreeNode, key_with_extra: RadixKey, original_value: torch.Tensor):
+    def _store_value_in_node(
+        self,
+        node: TreeNode,
+        key_with_extra: RadixKey,
+        original_value: torch.Tensor,
+        allow_delta_write: bool = True,
+    ):
         """
         (完整) 在给定的 token 节点上存储特定 extra_key 的 value。
         """
@@ -1151,7 +1364,8 @@ class RadixCache(BasePrefixCache):
             node.key.extra_key = extra_key 
             node.value = value_segment # Base 存储 *索引* (Tensor)
             # [Log] 记录 Base 创建
-            print(f"[DeltaCache] 🟦 Set Base: LoRA={extra_key} | NodeID={node.id}")
+            if self.delta_log_enabled:
+                print(f"[DeltaCache] 🟦 Set Base: LoRA={extra_key} | NodeID={node.id}")
         
         # Case 2: 插入的 extra_key 与 base 相同 (相同的不进行覆盖 base)
         elif node.key.extra_key == extra_key:
@@ -1164,10 +1378,44 @@ class RadixCache(BasePrefixCache):
         # Case 3: 插入的 extra_key 是一个新的 "delta"
         else:
             # [Log] 触发 Delta 存储逻辑
-            print(f"[DeltaCache] 🔀 Detect Variant: Base={node.key.extra_key} vs New={extra_key}")
+            if self.delta_log_enabled:
+                print(f"[DeltaCache] 🔀 Detect Variant: Base={node.key.extra_key} vs New={extra_key}")
 
             base_indices = node.value    # Base 配方
             delta_indices = value_segment # Delta 配方
+            if not allow_delta_write:
+                self.token_to_kv_pool_allocator.free(delta_indices)
+                return
+
+            if self.direct_delta_indices:
+                existing_delta_node = node.delta_node.get(extra_key)
+                if existing_delta_node and getattr(existing_delta_node, "base_node", None) is node:
+                    if self.delta_log_enabled:
+                        print(f"[DeltaCache] ♻️ Reuse existing Delta for {extra_key}")
+                    self.token_to_kv_pool_allocator.free(delta_indices)
+                    return
+                if existing_delta_node:
+                    if existing_delta_node.delta_data is not None:
+                        self.release_from_delta_pool(existing_delta_node.delta_data)
+                    if existing_delta_node.value is not None:
+                        try:
+                            self.token_to_kv_pool_allocator.free(existing_delta_node.value)
+                        except Exception:
+                            pass
+                new_delta_node = TreeNode()
+                new_delta_node.key = key_segment
+                new_delta_node.value = delta_indices
+                new_delta_node.delta_data = None
+                new_delta_node.base_node = node
+                node.delta_node[extra_key] = new_delta_node
+                return
+
+            existing_delta_node = node.delta_node.get(extra_key)
+            if existing_delta_node and getattr(existing_delta_node, "base_node", None) is node:
+                if self.delta_log_enabled:
+                    print(f"[DeltaCache] ♻️ Reuse existing Delta for {extra_key}")
+                self.token_to_kv_pool_allocator.free(delta_indices)
+                return
 
             # --- 3a. 调用 recompute_diff ---
             new_delta_node = self.recompute_diff(
@@ -1175,10 +1423,10 @@ class RadixCache(BasePrefixCache):
             )
             
             # --- 3b. 将新节点插入 delta_node 字典 ---
-            existing_delta_node = node.delta_node.get(extra_key)
             if existing_delta_node:
                 # [Log] 如果覆盖了旧的 Delta
-                print(f"[DeltaCache] 🔄 Overwriting existing Delta for {extra_key}")
+                if self.delta_log_enabled:
+                    print(f"[DeltaCache] 🔄 Overwriting existing Delta for {extra_key}")
                 self.release_from_delta_pool(existing_delta_node.delta_data) # 释放旧 handle
             
             new_delta_node.base_node = node
@@ -1211,6 +1459,10 @@ class RadixCache(BasePrefixCache):
         # Case 2: 请求的 extra_key 匹配一个 Delta
         delta_node = node.delta_node.get(extra_key)
         if delta_node:
+            if self.direct_delta_indices and getattr(delta_node, "value", None) is not None:
+                if delta_node.value.device != self.device:
+                    delta_node.value = delta_node.value.to(self.device)
+                return (delta_node.value, "base", None)
             # 检查 delta_data 是否是我们期望的格式
             if (delta_node.delta_data and isinstance(delta_node.delta_data, tuple)
                 and delta_node.delta_data[6] == "diff_list_v2"):
@@ -1218,13 +1470,19 @@ class RadixCache(BasePrefixCache):
                 # 我们需要 Base 节点的索引来进行重建
                 base_indices = node.value # Base 节点的索引存储在 .value
                 if base_indices is None:
-                     print(f"WARNING: Delta found for {extra_key} but base node {node.id} has no value!")
+                     if self.delta_log_enabled:
+                         print(
+                             f"WARNING: Delta found for {extra_key} but base node {node.id} has no value!"
+                         )
                      return (None, "miss", None)
 
                 # 返回: (句柄元组, "delta", Base的索引)
                 return (delta_node.delta_data, "delta", base_indices)
             else:
-                print(f"WARNING: Delta node {delta_node.id} for {extra_key} has invalid delta_data!")
+                if self.delta_log_enabled:
+                    print(
+                        f"WARNING: Delta node {delta_node.id} for {extra_key} has invalid delta_data!"
+                    )
                 return (None, "miss", None)
 
         # Case 3: Miss. Token 路径匹配了, 但此 LoRA 在此节点无数据
@@ -1262,10 +1520,22 @@ class RadixCache(BasePrefixCache):
             num_tokens_to_alloc = k_shape[0]
             if num_tokens_to_alloc == 0:
                 return torch.tensor([], dtype=torch.int64, device=self.device)
+            if self.page_size != 1 and (num_tokens_to_alloc % self.page_size) != 0:
+                if self.delta_log_enabled:
+                    print(
+                        f"[DeltaCache] ❌ Reconstruct skip: len={num_tokens_to_alloc} not page-aligned (page_size={self.page_size})"
+                    )
+                return None
                 
             new_indices = self.token_to_kv_pool_allocator.alloc(num_tokens_to_alloc)
-            if new_indices is None:
-                print(f"[DeltaCache] ❌ OOM Warning")
+            if new_indices is None or new_indices.numel() != num_tokens_to_alloc:
+                if new_indices is not None and new_indices.numel() > 0:
+                    try:
+                        self.token_to_kv_pool_allocator.free(new_indices)
+                    except Exception:
+                        pass
+                if self.delta_log_enabled:
+                    print(f"[DeltaCache] ❌ OOM Warning")
                 return None
 
             kv_cache = self.token_to_kv_pool_allocator.get_kvcache()
@@ -1295,7 +1565,10 @@ class RadixCache(BasePrefixCache):
                 kv_cache.v_buffer[i].index_copy_(0, new_indices, reconstructed_V)
 
             duration = (time.perf_counter() - start_time) * 1000
-            print(f"[DeltaCache] 📈 Read(Reconstruct-GPU): Tokens={num_tokens_to_alloc} | Time={duration:.2f}ms")
+            if self.delta_log_enabled:
+                print(
+                    f"[DeltaCache] 📈 Read(Reconstruct-GPU): Tokens={num_tokens_to_alloc} | Time={duration:.2f}ms"
+                )
 
             return new_indices
             
@@ -1340,6 +1613,12 @@ class RadixCache(BasePrefixCache):
             if delta_node.delta_data is not None:
                 # [Critical] 必须从全局池中释放内存，否则会泄露
                 self.release_from_delta_pool(delta_node.delta_data)
+            if self.direct_delta_indices and getattr(delta_node, "value", None) is not None:
+                try:
+                    self.token_to_kv_pool_allocator.free(delta_node.value)
+                except Exception:
+                    pass
+                delta_node.value = None
                 
         
         # 清空字典，断开引用

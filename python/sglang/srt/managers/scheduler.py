@@ -152,6 +152,7 @@ from sglang.srt.mem_cache.chunk_cache import ChunkCache, SWAChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.app_state_monitor import AppState, global_app_monitor
 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -696,6 +697,37 @@ class Scheduler(
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             self.tp_worker.get_memory_pool()
         )
+        state_weights = None
+        weights_str = server_args.app_state_weights
+        if weights_str:
+            try:
+                parts = [float(x) for x in weights_str.split(",") if x.strip() != ""]
+                if len(parts) == 3:
+                    state_weights = {
+                        AppState.FOREGROUND: parts[0],
+                        AppState.BACKGROUND: parts[1],
+                        AppState.KILLED: parts[2],
+                    }
+            except ValueError:
+                state_weights = None
+        global_app_monitor.configure(
+            mode=server_args.app_state_mode,
+            update_interval_s=server_args.app_state_interval,
+            state_weights=state_weights,
+            seed=server_args.app_state_seed,
+        )
+        mobilora_params = {
+            "lambda_s": server_args.mobilora_lambda_s,
+            "lambda_t": server_args.mobilora_lambda_t,
+            "lambda_l": server_args.mobilora_lambda_l,
+            "phi_s": server_args.mobilora_phi_s,
+            "phi_t": server_args.mobilora_phi_t,
+            "phi_l": server_args.mobilora_phi_l,
+            "time_decay_tau": server_args.mobilora_tau,
+            "length_norm": server_args.mobilora_len_norm,
+            "app_ttl_s": server_args.mobilora_app_ttl,
+            "app_agg": server_args.mobilora_app_agg,
+        }
 
         if (
             server_args.chunked_prefill_size is not None
@@ -728,6 +760,13 @@ class Scheduler(
                     enable_kv_cache_events=self.enable_kv_cache_events,
                 )
             elif self.enable_hierarchical_cache:
+                eviction_policy = server_args.radix_eviction_policy
+                if eviction_policy.lower() != "hicache":
+                    logger.info(
+                        "HiCache enabled: override radix eviction policy from %s to hicache.",
+                        eviction_policy,
+                    )
+                    eviction_policy = "hicache"
                 self.tree_cache = HiRadixCache(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -737,13 +776,17 @@ class Scheduler(
                         else self.tp_cpu_group
                     ),
                     page_size=self.page_size,
-                    eviction_policy=server_args.radix_eviction_policy,
+                    eviction_policy=eviction_policy,
+                    mobilora_params=mobilora_params,
                     hicache_ratio=server_args.hicache_ratio,
                     hicache_size=server_args.hicache_size,
                     hicache_write_policy=server_args.hicache_write_policy,
                     hicache_io_backend=server_args.hicache_io_backend,
                     hicache_mem_layout=server_args.hicache_mem_layout,
                     enable_metrics=self.enable_metrics,
+                    enable_delta_cache=server_args.enable_delta_cache,
+                    compression_backend=server_args.compression_backend,
+                    enable_kv_cache_events=self.enable_kv_cache_events,
                     hicache_storage_backend=server_args.hicache_storage_backend,
                     hicache_storage_prefetch_policy=server_args.hicache_storage_prefetch_policy,
                     model_name=server_args.served_model_name,
@@ -784,6 +827,7 @@ class Scheduler(
                     rank=self.tp_rank,
                     tp_group=self.tp_group,
                     eviction_policy=server_args.radix_eviction_policy,
+                    mobilora_params=mobilora_params,
                 )
             else:
                 enable_delta_cache = server_args.enable_delta_cache
@@ -795,6 +839,7 @@ class Scheduler(
                     disable=server_args.disable_radix_cache,
                     enable_kv_cache_events=self.enable_kv_cache_events,
                     eviction_policy=server_args.radix_eviction_policy,
+                    mobilora_params=mobilora_params,
                     is_eagle=self.spec_algorithm.is_eagle(),
                     enable_delta_cache=enable_delta_cache,
                     compression_backend=compression_backend,
@@ -1214,11 +1259,50 @@ class Scheduler(
 
         return image_inputs
 
+    def _coerce_app_state(self, value: Optional[Union[str, float, int, AppState]]) -> Optional[AppState]:
+        if value is None:
+            return None
+        if isinstance(value, AppState):
+            return value
+        if isinstance(value, (int, float)):
+            try:
+                return AppState(float(value))
+            except ValueError:
+                return None
+        if isinstance(value, str):
+            key = value.strip().lower()
+            if key in ("foreground", "fg", "active"):
+                return AppState.FOREGROUND
+            if key in ("background", "bg", "inactive"):
+                return AppState.BACKGROUND
+            if key in ("killed", "kill", "dead", "stopped"):
+                return AppState.KILLED
+            try:
+                return AppState(float(key))
+            except ValueError:
+                return None
+        return None
+
+    def _update_app_states_from_req(self, recv_req: TokenizedGenerateReqInput) -> None:
+        if recv_req.app_states:
+            for app_id, state_raw in recv_req.app_states.items():
+                if not app_id:
+                    continue
+                state = self._coerce_app_state(state_raw)
+                if state is not None:
+                    global_app_monitor.update_state(app_id, state)
+            return
+        if recv_req.app_state and recv_req.app_id:
+            state = self._coerce_app_state(recv_req.app_state)
+            if state is not None:
+                global_app_monitor.update_state(recv_req.app_id, state)
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
         # Create a new request
+        self._update_app_states_from_req(recv_req)
         if (
             recv_req.session_params is None
             or recv_req.session_params.id is None
@@ -1259,6 +1343,7 @@ class Scheduler(
                     self.metrics_collector if self.enable_metrics else None
                 ),
                 http_worker_ipc=recv_req.http_worker_ipc,
+                app_id=recv_req.app_id,
             )
             req.tokenizer = self.tokenizer
 

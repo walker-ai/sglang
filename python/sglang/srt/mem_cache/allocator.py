@@ -78,7 +78,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def free_group_end(self):
         self.is_not_in_free_group = True
         if self.free_group:
-            self.free(torch.cat(self.free_group))
+            # Ensure all tensors are on allocator device before concat
+            tensors = [t.to(self.device) for t in self.free_group]
+            self.free(torch.cat(tensors))
 
     def merge_and_sort_free(self):
         if len(self.release_pages) > 0:
@@ -156,6 +158,10 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
+
+        # 保证索引张量与 allocator 的 device 对齐，避免 concat 跨设备报错
+        if free_index.device.type != self.device.split(":")[0]:
+            free_index = free_index.to(self.device)
 
         if self.is_not_in_free_group:
             if self.need_sort:

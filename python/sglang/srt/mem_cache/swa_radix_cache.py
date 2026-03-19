@@ -479,7 +479,11 @@ class SWARadixCache(BasePrefixCache):
         # Note: the insert function already frees the overlapped kv_indices
         if is_insert:
             new_prefix_len = self.insert(
-                RadixKey(token_ids[:page_aligned_token_len], req.extra_key),
+                RadixKey(
+                    token_ids[:page_aligned_token_len],
+                    req.extra_key,
+                    req.app_id,
+                ),
                 page_aligned_kv_indices,
                 old_prefix_len,
             )
@@ -539,14 +543,14 @@ class SWARadixCache(BasePrefixCache):
         # Radix Cache takes one ref in memory pool
         # Note: the insert function already frees the overlapped kv_indices
         new_prefix_len = self.insert(
-            RadixKey(page_aligned_token_ids, req.extra_key),
+            RadixKey(page_aligned_token_ids, req.extra_key, req.app_id),
             page_aligned_kv_indices,
             old_prefix_len,
         )
 
         # The prefix indices could be updated, reuse it
         new_indices, new_last_node, _, _ = self.match_prefix(
-            RadixKey(page_aligned_token_ids, req.extra_key)
+            RadixKey(page_aligned_token_ids, req.extra_key, req.app_id)
         )
         assert old_prefix_len <= len(
             new_indices

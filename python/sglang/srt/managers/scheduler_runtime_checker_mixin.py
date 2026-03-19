@@ -59,17 +59,153 @@ class SchedulerRuntimeCheckerMixin:
         )
         return memory_leak, token_msg
 
+    def _estimate_inflight_tokens(self: Scheduler) -> int:
+        """Estimate tokens currently allocated but not yet reflected in tree/protected sizes."""
+        current_batch: ScheduleBatch = self.last_batch
+        running_batch: ScheduleBatch = getattr(self, "running_batch", None)
+
+        extend_size = 0
+        if current_batch is not None:
+            for req in current_batch.reqs:
+                seq_len = len(req.origin_input_ids) + len(req.output_ids)
+                fill_len = len(req.fill_ids) if req.fill_ids is not None else 0
+                prefix_len = len(req.prefix_indices) if req.prefix_indices is not None else 0
+
+                if current_batch.forward_mode.is_decode():
+                    if req.finished():
+                        unreleased_len = 1
+                    else:
+                        unreleased_len = seq_len - prefix_len
+                else:
+                    unreleased_len = fill_len - prefix_len
+
+                extend_size += unreleased_len
+
+        if (
+            current_batch is not None
+            and current_batch.forward_mode.is_extend()
+            and running_batch is not None
+            and not running_batch.is_empty()
+            and running_batch.forward_mode.is_decode()
+        ):
+            for req in running_batch.reqs:
+                seq_len = len(req.origin_input_ids) + len(req.output_ids)
+                prefix_len = len(req.prefix_indices) if req.prefix_indices is not None else 0
+
+                if req.finished():
+                    unreleased_len = 0
+                else:
+                    unreleased_len = seq_len - prefix_len - 1
+
+                extend_size += unreleased_len
+
+        return extend_size
+
     def _check_radix_cache_memory(self: Scheduler):
-        _, _, available_size, evictable_size = self._get_token_info()
+        # Always recompute evictable from the tree to avoid stale counters.
+        if hasattr(self.tree_cache, "recompute_evictable_size"):
+            try:
+                evictable_size = self.tree_cache.recompute_evictable_size()
+            except Exception:
+                evictable_size = self.tree_cache.evictable_size()
+        else:
+            evictable_size = self.tree_cache.evictable_size()
+
         protected_size = self.tree_cache.protected_size()
-        memory_leak = (available_size + evictable_size) != (
-            # self.max_total_num_tokens
-            # if not self.enable_hierarchical_cache
-            # else self.max_total_num_tokens - protected_size
+        extend_size = self._estimate_inflight_tokens()
+        # Derive available by subtracting known used/protected from capacity.
+        available_size = self.max_total_num_tokens - (evictable_size + protected_size)
+        # Use derived accounting for leak check.
+        memory_leak = (available_size + evictable_size + protected_size + extend_size) != (
             self.max_total_num_tokens
-            - protected_size
         )
-        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+        if memory_leak:
+            locked_nodes = []
+            value_nodes = []
+
+            def _collect(node):
+                for child in node.children.values():
+                    if getattr(child, "lock_ref", 0) > 0:
+                        locked_nodes.append(
+                            {
+                                "len": len(child.key),
+                                "lock_ref": child.lock_ref,
+                                "evicted": bool(getattr(child, "value", None) is None),
+                                "is_base": getattr(child, "is_base", False),
+                                "extra": getattr(child.key, "extra_key", None),
+                            }
+                        )
+                    val = getattr(child, "value", None)
+                    if val is not None:
+                        value_nodes.append(
+                            {
+                                "len": len(val),
+                                "key_len": len(child.key),
+                                "extra": getattr(child.key, "extra_key", None),
+                                "node_id": getattr(child, "id", None),
+                            }
+                        )
+                    _collect(child)
+
+            _collect(self.tree_cache.root_node)
+            recomputed_evictable = sum(v["len"] for v in value_nodes)
+
+            # Compare allocator vs tree index sets to locate missing/extra indices.
+            missing = []
+            extra = []
+            dup_count = -1
+            free_len = release_len = used_est = -1
+            try:
+                free_pages = getattr(self.token_to_kv_pool_allocator, "free_pages", None)
+                release_pages = getattr(self.token_to_kv_pool_allocator, "release_pages", None)
+                free_list = []
+                if free_pages is not None:
+                    free_list.extend(free_pages.tolist())
+                if release_pages is not None:
+                    free_list.extend(release_pages.tolist())
+                free_set = set(int(x) for x in free_list)
+                free_len = len(free_set)
+                used_set_est = set(range(1, self.token_to_kv_pool_allocator.size + 1)) - free_set
+                used_est = len(used_set_est)
+
+                tree_indices = []
+                # collect actual tensor refs to avoid double conversion
+                for node in self.tree_cache.root_node.children.values():
+                    pass
+                def _collect_indices(node):
+                    val = getattr(node, "value", None)
+                    if val is not None:
+                        try:
+                            tree_indices.extend(int(i) for i in val.tolist())
+                        except Exception:
+                            pass
+                    for ch in node.children.values():
+                        _collect_indices(ch)
+                _collect_indices(self.tree_cache.root_node)
+                tree_set = set(tree_indices)
+                missing = list(used_set_est - tree_set)
+                extra = list(tree_set - used_set_est)
+                dup_count = len(tree_indices) - len(tree_set)
+            except Exception:
+                pass
+            # 限制日志长度，最多展示前 50 个节点
+            value_preview = value_nodes[:50]
+            locked_preview = locked_nodes[:50]
+            logger.error(
+                "KV pool accounting mismatch: "
+                f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}, {extend_size=}, "
+                f"tree_evictable={getattr(self.tree_cache, 'evictable_size_', 'n/a')}, "
+                f"tree_protected={getattr(self.tree_cache, 'protected_size_', 'n/a')}, "
+                f"locked_nodes(total={len(locked_nodes)}): {locked_preview}, "
+                f"value_nodes(total={len(value_nodes)}): {value_preview}, "
+                f"recomputed_evictable={recomputed_evictable}, dup_in_tree={dup_count}, "
+                f"missing_in_tree_sample={missing[:20]}, extra_in_tree_sample={extra[:20]}, "
+                f"free_total={free_len}, used_est={used_est}"
+            )
+        token_msg = (
+            f"{self.max_total_num_tokens=}, {available_size=}, "
+            f"{evictable_size=}, {protected_size=}, {extend_size=}\n"
+        )
         return memory_leak, token_msg
 
     def _check_runtime_mem_leak(self: Scheduler):
@@ -149,6 +285,30 @@ class SchedulerRuntimeCheckerMixin:
             memory_leak, token_msg = self._check_radix_cache_memory()
 
         if memory_leak:
+            # Best-effort pruning of stale tree nodes pointing to already-freed indices.
+            try:
+                import torch
+
+                free_pages = getattr(self.token_to_kv_pool_allocator, "free_pages", None)
+                release_pages = getattr(self.token_to_kv_pool_allocator, "release_pages", None)
+                free_list = []
+                if free_pages is not None:
+                    free_list.extend(free_pages.tolist())
+                if release_pages is not None:
+                    free_list.extend(release_pages.tolist())
+                free_set = set(int(x) for x in free_list)
+                if hasattr(self.tree_cache, "prune_stale_values"):
+                    self.tree_cache.prune_stale_values(free_set)
+                    # Re-evaluate after pruning
+                    _, _, available_size, evictable_size = self._get_token_info()
+                    protected_size = self.tree_cache.protected_size()
+                    if (available_size + evictable_size) == (
+                        self.max_total_num_tokens - protected_size
+                    ):
+                        return
+            except Exception:
+                logger.exception("Failed to prune stale values during memory check")
+
             msg = "token_to_kv_pool_allocator memory leak detected! " f"{token_msg}"
             raise ValueError(msg)
 

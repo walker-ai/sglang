@@ -1,9 +1,10 @@
 import heapq
+import os
 import json
 import logging
 import threading
 import time
-from typing import List, Optional
+from typing import Dict, List, Optional, Union
 
 import torch
 
@@ -40,13 +41,20 @@ class HiRadixCache(RadixCache):
         hicache_mem_layout: str,
         enable_metrics: bool,
         eviction_policy: str = "lru",
+        mobilora_params: Optional[Dict[str, Union[float, str]]] = None,
         hicache_storage_backend: Optional[str] = None,
         hicache_storage_prefetch_policy: Optional[str] = "best_effort",
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[str] = None,
         is_eagle: bool = False,
+        enable_delta_cache: Optional[bool] = False,
+        compression_backend: Optional[str] = None,
+        enable_kv_cache_events: bool = False,
+        disable: bool = False,
     ):
-
+        if enable_delta_cache:
+            # 使用 print 保证一定可见，方便确认 delta 已启用
+            print(f"[HiRadixCache] Delta cache enabled (backend={compression_backend}, page_size={page_size})")
         if hicache_io_backend == "direct":
             if hicache_mem_layout == "page_first":
                 hicache_mem_layout = "page_first_direct"
@@ -133,12 +141,16 @@ class HiRadixCache(RadixCache):
         self.load_back_threshold = 10
 
         super().__init__(
-            req_to_token_pool,
-            token_to_kv_pool_allocator,
-            page_size,
-            disable=False,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            page_size=page_size,
+            disable=disable,
+            enable_kv_cache_events=enable_kv_cache_events,
             eviction_policy=eviction_policy,
+            mobilora_params=mobilora_params,
             is_eagle=is_eagle,
+            enable_delta_cache=enable_delta_cache,
+            compression_backend=compression_backend,
         )
 
     def _parse_storage_backend_extra_config(
@@ -194,8 +206,11 @@ class HiRadixCache(RadixCache):
 
     def reset(self):
         TreeNode.counter = 0
-        self.cache_controller.reset()
-        self.token_to_kv_pool_host.clear()
+        # 在基类 __init__ 期间，cache_controller 还未初始化，需判空。
+        if hasattr(self, "cache_controller") and self.cache_controller is not None:
+            self.cache_controller.reset()
+        if hasattr(self, "token_to_kv_pool_host") and self.token_to_kv_pool_host is not None:
+            self.token_to_kv_pool_host.clear()
         super().reset()
 
     def get_height(self, node: TreeNode):
@@ -339,6 +354,19 @@ class HiRadixCache(RadixCache):
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
+        debug = os.getenv("SGLANG_EVICT_DEBUG", "0") == "1"
+        debug_samples = int(os.getenv("SGLANG_EVICT_DEBUG_SAMPLES", "3"))
+        debug_strategy = getattr(self.eviction_strategy, "debug_components", None)
+        debug_logged = 0
+        if debug:
+            print(
+                "[evict_debug] "
+                f"policy={self.eviction_strategy.__class__.__name__} "
+                f"leaves={len(leaves)} "
+                f"target={num_tokens} "
+                f"evictable={self.evictable_size_} "
+                f"protected={self.protected_size_}"
+            )
 
         num_evicted = 0
         write_back_nodes = []
@@ -347,6 +375,28 @@ class HiRadixCache(RadixCache):
 
             if x.lock_ref > 0:
                 continue
+
+            if debug and debug_strategy and debug_logged < debug_samples:
+                (
+                    state_score,
+                    lru_score,
+                    length_score,
+                    phi_s_val,
+                    phi_t_val,
+                    phi_l_val,
+                    utility,
+                ) = debug_strategy(x)
+                app_count = len(getattr(x, "associated_apps", ()))
+                value_len = len(x.value) if x.value is not None else 0
+                age = max(time.monotonic() - x.last_access_time, 0.0)
+                print(
+                    "[evict_debug] "
+                    f"node={x.id} apps={app_count} value_len={value_len} age={age:.3f} "
+                    f"state_sum={state_score:.3f} lru={lru_score:.3f} len={length_score:.1f} "
+                    f"phi_s={phi_s_val:.3f} phi_t={phi_t_val:.3f} phi_l={phi_l_val:.3f} "
+                    f"priority={_priority:.3f} utility={utility:.3f}"
+                )
+                debug_logged += 1
 
             if not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
@@ -373,6 +423,14 @@ class HiRadixCache(RadixCache):
             for node in write_back_nodes:
                 assert node.backuped
                 self._evict_backuped(node)
+
+        if debug:
+            print(
+                "[evict_debug] "
+                f"evicted_tokens={num_evicted} "
+                f"remaining_evictable={self.evictable_size_} "
+                f"protected={self.protected_size_}"
+            )
 
     def _evict_backuped(self, node: TreeNode):
         # evict a node already written to host
@@ -685,11 +743,47 @@ class HiRadixCache(RadixCache):
             page_aligned_len = len(key) // self.page_size * self.page_size
             key = key[:page_aligned_len]
 
-        value, last_node = self._match_prefix_helper(self.root_node, key)
-        if value:
-            value = torch.cat(value)
+        # 对齐后可能变成空键，直接返回空匹配
+        if len(key) == 0:
+            return MatchResult(
+                device_indices=empty_value,
+                last_device_node=self.root_node,
+                last_host_node=self.root_node,
+                host_hit_length=0,
+            )
+
+        value = empty_value
+        last_node = self.root_node
+        if self.enable_delta_cache:
+            print(f"[HiRadixCache] match_prefix delta enabled, extra_key={key.extra_key}, len={len(key)}")
+            # 直接调用 RadixCache 的差分匹配辅助，避免使用 HiRadix 自己的 _match_prefix_helper（该函数带 extra_key 检查会触发冲突）。
+            collected_segments_info, last_node = RadixCache._match_prefix_helper(self, self.root_node, key)
+
+            final_indices_list = []
+            for segment_info in collected_segments_info:
+                if len(segment_info) < 3:
+                    print(f"[DeltaCache Debug] segment_info too short: len={len(segment_info)}, data={segment_info}")
+                    continue
+                data, seg_type, metadata = segment_info[:3]
+                if seg_type == "base":
+                    final_indices_list.append(data)
+                elif seg_type == "delta":
+                    newly_allocated_indices = self._reconstruct_and_alloc((data, seg_type, metadata))
+                    if newly_allocated_indices is None:
+                        break
+                    final_indices_list.append(newly_allocated_indices)
+
+            if final_indices_list:
+                value = torch.cat(final_indices_list)
+                # Safety: never return more cached indices than the request length.
+                if value.numel() > len(key):
+                    value = value[: len(key)]
         else:
-            value = empty_value
+            value, last_node = self._match_prefix_helper(self.root_node, key)
+            if value:
+                value = torch.cat(value)
+            else:
+                value = empty_value
 
         host_hit_length = 0
         last_host_node = last_node
@@ -705,6 +799,31 @@ class HiRadixCache(RadixCache):
             last_host_node=last_host_node,
             host_hit_length=host_hit_length,
         )
+
+    def _ensure_hash_values(self, key: RadixKey):
+        """Ensure hash_value is populated along the path for storage backends."""
+        if not self.enable_storage:
+            return
+        node = self.root_node
+        child_key = self.get_child_key_fn(key)
+        last_hash = None
+        while len(key) > 0 and child_key in node.children:
+            node = node.children[child_key]
+            if node.hash_value is None:
+                node.hash_value = []
+                for idx in range(0, len(node.key), self.page_size):
+                    node.hash_value.append(
+                        self.cache_controller.get_hash_str(
+                            node.key.token_ids[idx : idx + self.page_size],
+                            prior_hash=last_hash,
+                        )
+                    )
+                    last_hash = node.hash_value[-1]
+            else:
+                last_hash = node.get_last_hash_value()
+            key = key[len(node.key) :]
+            if len(key):
+                child_key = self.get_child_key_fn(key)
 
     def prefetch_from_storage(
         self,
@@ -784,15 +903,18 @@ class HiRadixCache(RadixCache):
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
+        self._associate_app(node, key.app_id)
         child_key = self.get_child_key_fn(key)
         value = []
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
+            self._associate_app(child, key.app_id)
             prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
+                self._associate_app(new_node, key.app_id)
                 if not new_node.evicted:
                     value.append(new_node.value)
                 node = new_node
@@ -816,6 +938,8 @@ class HiRadixCache(RadixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
+        new_node.associated_apps = set(child.associated_apps)
+        new_node.associated_app_last_seen = dict(child.associated_app_last_seen)
 
         # split value and host value if exists
         if child.evicted:
@@ -835,7 +959,35 @@ class HiRadixCache(RadixCache):
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
         return new_node
 
-    def insert(self, key: RadixKey, value=None, chunked=False):
+    def insert(
+        self,
+        key: RadixKey,
+        value=None,
+        chunked: bool = False,
+        allow_delta_write: bool = True,
+    ):
+        if self.enable_delta_cache:
+            # 复用 RadixCache 的差分存储逻辑，以触发 delta 日志。
+            key.token_ids = self.key_convert_fn(key.token_ids)
+            if value is None:
+                value = torch.tensor(key.token_ids, dtype=torch.int64)
+            if self.is_eagle and value is not None:
+                value = value[: len(key)]
+            print(f"[HiRadixCache] insert delta enabled, extra_key={key.extra_key}, len={len(key)}")
+            if len(key) == 0:
+                return 0
+            prefix_len = super().insert(
+                key, value, chunked, allow_delta_write=allow_delta_write
+            )
+            try:
+                print(f"[HiRadixCache] insert delta done, prefix_len={prefix_len}")
+            except Exception:
+                pass
+            # 补充 HiCache 的 hash 计算（仅当启用存储）
+            if self.enable_storage:
+                self._ensure_hash_values(key)
+            return prefix_len
+
         key.token_ids = self.key_convert_fn(key.token_ids)
 
         if len(key) == 0:

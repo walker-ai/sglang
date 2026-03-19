@@ -453,7 +453,7 @@ class MambaRadixCache(BasePrefixCache):
 
         if is_insert:
             new_prefix_len, mamba_exist = self.insert(
-                RadixKey(token_ids[:page_aligned_len], req.extra_key),
+                RadixKey(token_ids[:page_aligned_len], req.extra_key, req.app_id),
                 page_aligned_kv_indices,
                 mamba_value,
             )
@@ -504,7 +504,7 @@ class MambaRadixCache(BasePrefixCache):
             )
             assert mamba_value_forked is not None, "Can not alloc mamba cache"
         new_prefix_len, mamba_exist = self.insert(
-            RadixKey(page_aligned_token_ids, req.extra_key),
+            RadixKey(page_aligned_token_ids, req.extra_key, req.app_id),
             page_aligned_kv_indices,
             mamba_value_forked,
         )
@@ -517,7 +517,7 @@ class MambaRadixCache(BasePrefixCache):
 
         # The prefix indices could be updated, reuse it
         new_indices, new_last_node, _, _ = self.match_prefix(
-            RadixKey(page_aligned_token_ids, req.extra_key)
+            RadixKey(page_aligned_token_ids, req.extra_key, req.app_id)
         )
 
         if not mamba_exist:

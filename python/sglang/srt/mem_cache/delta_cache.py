@@ -12,7 +12,14 @@ class CompressorBackend:
     def compress(self, tensor: torch.Tensor, error_bound: float) -> Union[torch.Tensor, np.ndarray]:
         raise NotImplementedError
 
-    def decompress(self, data: Union[torch.Tensor, np.ndarray], shape: torch.Size, dtype: torch.dtype, error_bound: float) -> torch.Tensor:
+    def decompress(
+        self,
+        data: Union[torch.Tensor, np.ndarray],
+        shape: torch.Size,
+        dtype: torch.dtype,
+        error_bound: float,
+        compressed_len: Optional[int] = None,
+    ) -> torch.Tensor:
         raise NotImplementedError
 
     def get_name(self) -> str:
@@ -29,13 +36,22 @@ class SZBackend(CompressorBackend):
         self.sz = SZ(f"/home/wangyitao/tools/SZ3/install/lib/{lib_extension}")
         print("[RadixCache] Initialized SZ Backend (CPU)")
 
-    def compress(self, target_tensor: torch.Tensor, error_bound: float) -> np.ndarray:
+    def compress(self, target_tensor: torch.Tensor, error_bound: float) -> Tuple[np.ndarray, int]:
         # SZ 需要 numpy 输入 (CPU)
         diff_numpy = target_tensor.detach().cpu().float().numpy()
         diff_compressed, _ = self.sz.compress(diff_numpy, eb_mode=0, eb_abs=error_bound, eb_rel=0, eb_pwr=0)
-        return diff_compressed
+        return diff_compressed, diff_compressed.nbytes
 
-    def decompress(self, compressed_data: np.ndarray, shape: torch.Size, dtype: torch.dtype, error_bound: float) -> torch.Tensor:
+    def decompress(
+        self,
+        compressed_data: np.ndarray,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        error_bound: float,
+        compressed_len: Optional[int] = None,
+    ) -> torch.Tensor:
+        if isinstance(compressed_data, (tuple, list)) and len(compressed_data) == 2:
+            compressed_data, _ = compressed_data
         # SZ 解压不需要 error_bound (元数据在 header 中)，但为了接口统一保留参数
         decompressed_numpy = self.sz.decompress(compressed_data, shape, original_dtype=np.float32)
         # 转回 Tensor 并移动到 GPU
@@ -54,7 +70,7 @@ class CuSZpBackend(CompressorBackend):
         self.CUSZ_DTYPE_FP32 = 0
         print("[RadixCache] Initialized cuSZp Backend (GPU)")
 
-    def compress(self, target_tensor: torch.Tensor, error_bound: float) -> torch.Tensor:
+    def compress(self, target_tensor: torch.Tensor, error_bound: float) -> Tuple[torch.Tensor, int]:
         # 1. 转换类型并确保内存连续 (GPU->GPU copy)
         src_float = target_tensor.to(torch.float32).contiguous()
         
@@ -74,6 +90,8 @@ class CuSZpBackend(CompressorBackend):
             data_type=self.CUSZ_DTYPE_FP32,
             mode=self.CUSZ_MODE_ABS
         )
+        if compressed_len <= 0 or compressed_len > max_size:
+            compressed_len = max_size
 
         # 4. 安全 Padding (防止 Warp Illegal Address)
         SAFETY_PADDING = 4096 
@@ -81,21 +99,33 @@ class CuSZpBackend(CompressorBackend):
         if padded_len > max_size:
             padded_len = max_size
 
-        return compressed_buffer[:padded_len].clone()
+        compressed_tensor = compressed_buffer[:padded_len].clone()
+        return compressed_tensor, compressed_len
 
-    def decompress(self, compressed_data: torch.Tensor, shape: torch.Size, dtype: torch.dtype, error_bound: float) -> torch.Tensor:
+    def decompress(
+        self,
+        compressed_data: torch.Tensor,
+        shape: torch.Size,
+        dtype: torch.dtype,
+        error_bound: float,
+        compressed_len: Optional[int] = None,
+    ) -> torch.Tensor:
+        if isinstance(compressed_data, (tuple, list)) and len(compressed_data) == 2:
+            compressed_data, compressed_len = compressed_data
         num_elements = 1
         for dim in shape:
             num_elements *= dim
             
         decompressed_float = torch.empty(num_elements, dtype=torch.float32, device=self.device).contiguous()
-        compressed_len = compressed_data.numel() # 包含 Padding 的长度
+        compressed_size = compressed_len if compressed_len is not None else compressed_data.numel()
+        if compressed_size <= 0 or compressed_size > compressed_data.numel():
+            compressed_size = compressed_data.numel()
 
         self.cusz.decompress(
             d_decData=ctypes.c_void_p(decompressed_float.data_ptr()),
             d_cmpBytes=ctypes.c_void_p(compressed_data.data_ptr()),
             num_elements=num_elements,
-            compressed_size=compressed_len, 
+            compressed_size=compressed_size, 
             error_bound=error_bound,
             dim=1,
             dims=(num_elements, 1, 1),
